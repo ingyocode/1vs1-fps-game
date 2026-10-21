@@ -36,7 +36,7 @@ import { ViewModel } from './viewmodel';
 import { ProjectileSystem, type Grenade } from './projectiles';
 import { CoinField } from './coins';
 import { WEAPONS, type WeaponDef, type WeaponId } from './weapons';
-import { ABILITIES, activeSynergies, applyPick, hasSynergy, stat, type AbilityId, type DraftCard, type Rarity, type ThrowKind } from './abilities';
+import { ABILITIES, VULN_BONUS, activeSynergies, applyPick, hasSynergy, stat, tierOf, type AbilityId, type DraftCard, type ThrowKind, type Tier } from './abilities';
 import type { MatchHost } from './host';
 import { SUN_DIR } from '../render/environment';
 import { cinematicCamera } from '../render/cinematic';
@@ -223,6 +223,8 @@ export class GameClient implements PlayerHooks {
   private draftCards: DraftCard[] = [];
   private stSeq = 0;
   private lastDraft: DraftCard | null = null;
+  /** Exposed by an enemy's awakened recon (local clock). */
+  private vulnUntil = 0;
 
   constructor(
     private deps: ClientDeps,
@@ -334,7 +336,7 @@ export class GameClient implements PlayerHooks {
         break;
       case 'draftWait':
         // The roster update with the new pick arrives right after; preview it now.
-        ui.draft.waiting(this.lastDraft ? applyPick(this.me?.abilities ?? [], this.lastDraft).list : (this.me?.abilities ?? []));
+        ui.draft.waiting(this.lastDraft ? applyPick(this.me?.abilities ?? [], this.lastDraft) : (this.me?.abilities ?? []));
         break;
       case 'roundStart':
         this.onRoundStart(msg.round, msg.spawns);
@@ -372,7 +374,13 @@ export class GameClient implements PlayerHooks {
         this.projectiles.spawn(msg);
         break;
       case 'ability':
-        this.onRemoteAbility(msg.id, msg.ability);
+        if (msg.id !== this.selfId) this.onRemoteAbility(msg.id, msg.ability);
+        else if (msg.ability === 'heal' && msg.data?.[0] === 1) {
+          // Host-triggered: our awakened heal just absorbed a lethal hit.
+          for (let i = 0; i < 6; i++) this.effects.healAura(this.local.motor.body.pos);
+          audio.ability('heal', null);
+          ui.hud.toast('불사 프로토콜 발동 · 치명상을 버텼습니다', 'good', 2.2);
+        }
         break;
       case 'barrier':
         this.addBarrier(msg);
@@ -393,10 +401,18 @@ export class GameClient implements PlayerHooks {
           const until = performance.now() + msg.duration * 1000;
           for (const id of msg.targets) this.reveals.set(id, Math.max(this.reveals.get(id) ?? 0, until));
           if (msg.kind === 'pulse' && msg.origin) this.effects.pulse(new THREE.Vector3(...msg.origin), 30, TEAMS[this.myTeam].color);
-          if (msg.targets.length) ui.hud.toast(msg.kind === 'mark' ? '표식: 적 위치 노출' : `정찰 펄스: 적 ${msg.targets.length}명 노출`, 'good');
+          if (msg.targets.length) ui.hud.toast(msg.kind === 'mark' ? '표식: 적 위치 노출' : `정찰 펄스: 적 ${msg.targets.length}명 노출${msg.vuln ? ` · 받는 피해 +${Math.round(VULN_BONUS * 100)}%` : ''}`, 'good');
         } else if (msg.kind === 'pulse' && msg.origin) {
           // The sound already plays from the matching 'ability' event.
           this.effects.pulse(new THREE.Vector3(...msg.origin), 30, 0xff3a4a);
+        }
+        break;
+      case 'debuff':
+        if (msg.target !== this.selfId || !this.local.alive) break;
+        if (msg.kind === 'slow') this.local.slow(msg.duration);
+        else {
+          this.vulnUntil = performance.now() + msg.duration * 1000;
+          ui.hud.toast(`약점 노출 · 받는 피해 +${Math.round(VULN_BONUS * 100)}%`, 'warn', 1.8);
         }
         break;
       case 'gold':
@@ -550,6 +566,7 @@ export class GameClient implements PlayerHooks {
     this.coins.clear();
     for (const id of [...this.barriers.keys()]) this.removeBarrier(id, true);
     this.reveals.clear();
+    this.vulnUntil = 0;
     for (const r of this.remotes.values()) r.avatar.setRevealed(false);
   }
 
@@ -644,11 +661,11 @@ export class GameClient implements PlayerHooks {
       this.local.recoilPitch += Math.min(0.05, msg.amount * 0.0008);
     } else if (msg.attacker === this.selfId && msg.zone === 'blast') {
       this.deps.ui.hud.hitmarker(false, false);
-    } else if (msg.attacker === this.selfId && msg.zone === 'toxic') {
+    } else if (msg.attacker === this.selfId && (msg.zone === 'toxic' || msg.zone === 'shock')) {
       this.deps.ui.hud.hitmarker(false, false);
     }
     const r = this.remotes.get(msg.target);
-    if (r && msg.zone !== 'toxic') this.effects.blood(r.hitbox.center.clone(), new THREE.Vector3(0, 0.5, 0), msg.zone === 'head');
+    if (r && msg.zone !== 'toxic' && msg.zone !== 'shock') this.effects.blood(r.hitbox.center.clone(), new THREE.Vector3(0, 0.5, 0), msg.zone === 'head');
   }
 
   private onKill(killerId: string, victimId: string, w: WeaponId | AbilityId, head: boolean, assister: string | null): void {
@@ -669,7 +686,8 @@ export class GameClient implements PlayerHooks {
     if (killerId === this.selfId && victimId !== this.selfId) {
       ui.hud.hitmarker(head, true);
       this.deps.audio.killConfirm(head);
-      ui.hud.toast(head ? `헤드샷 처치 · ${victim?.name ?? ''}` : `처치 · ${victim?.name ?? ''}`, 'good', 1.8);
+      const bonus = this.local.alive ? this.local.onKill() : null;
+      ui.hud.toast(`${head ? '헤드샷 처치' : '처치'} · ${victim?.name ?? ''}${bonus ? ` · ${bonus}` : ''}`, 'good', 1.8);
     }
     if (victimId === this.selfId) {
       this.local.alive = false;
@@ -854,17 +872,17 @@ export class GameClient implements PlayerHooks {
     return cam.localToWorld(new THREE.Vector3(0.12, -0.12, -0.6));
   }
 
-  onThrow(kind: ThrowKind, pos: THREE.Vector3, vel: THREE.Vector3, rarity: Rarity): void {
+  onThrow(kind: ThrowKind, pos: THREE.Vector3, vel: THREE.Vector3, tier: Tier): void {
     // The host only accepts throws from living players during combat; never show a local-only grenade.
     if (this.phase !== 'live' || !this.local.alive) return;
     const syn: string[] = [];
     for (const s of ['blindfog', 'toxic', 'markflash', 'seeker']) if (hasSynergy(this.local.owned, s)) syn.push(s);
-    const msg: ThrowMsg = { t: 'throw', gid: `${this.selfId}-${++this.throwSeq}`, kind, owner: this.selfId, team: this.myTeam, pos: v3(pos), vel: v3(vel), rarity, syn };
+    const msg: ThrowMsg = { t: 'throw', gid: `${this.selfId}-${++this.throwSeq}`, kind, owner: this.selfId, team: this.myTeam, pos: v3(pos), vel: v3(vel), tier, syn };
     this.projectiles.spawn(msg);
     this.net.toHost(msg);
   }
 
-  onAbility(id: AbilityId, _rarity: Rarity): void {
+  onAbility(id: AbilityId, _tier: Tier): void {
     const audio = this.deps.audio;
     if (ABILITIES[id].type === 'throw') return;
     audio.ability(id, null);
@@ -875,19 +893,18 @@ export class GameClient implements PlayerHooks {
     this.deps.ui.hud.toast(`${ABILITIES[id].name} 사용`, 'info', 1.2);
   }
 
-  onRecon(radius: number, duration: number): void {
+  onRecon(origin: THREE.Vector3, radius: number, duration: number): void {
     this.deps.ui.hud.pulse(TEAMS[this.myTeam].css);
-    const me = this.local.motor.body.pos;
     const targets: string[] = [];
     for (const r of this.remotes.values()) {
       const info = this.infos.get(r.id);
       if (!info || !info.alive || info.team === this.myTeam) continue;
-      if (r.pos.distanceTo(me) <= radius) targets.push(r.id);
+      if (r.pos.distanceTo(origin) <= radius) targets.push(r.id);
     }
-    this.net.toHost({ t: 'reveal', targets, duration, origin: v3(this.local.eye), kind: 'pulse' });
+    this.net.toHost({ t: 'reveal', targets, duration, origin: v3(origin), kind: 'pulse' });
   }
 
-  onBarrier(pos: THREE.Vector3, yaw: number, rarity: Rarity): void {
+  onBarrier(pos: THREE.Vector3, yaw: number, tier: Tier): void {
     this.net.toHost({
       t: 'barrier',
       bid: `${this.selfId}-b${++this.throwSeq}`,
@@ -895,15 +912,22 @@ export class GameClient implements PlayerHooks {
       team: this.myTeam,
       pos: v3(pos),
       yaw,
-      width: stat('barrier', 'width', rarity),
-      hp: stat('barrier', 'hp', rarity),
-      duration: stat('barrier', 'duration', rarity),
+      width: stat('barrier', 'width', tier),
+      hp: stat('barrier', 'hp', tier),
+      duration: stat('barrier', 'duration', tier),
       regen: hasSynergy(this.local.owned, 'regenwall'),
     });
   }
 
   onFootstep(): void {
+    if (this.local.cloakT > 0 && this.silentCloak(this.selfId)) return;
     this.deps.audio.footstep(null, this.local.motor.body.pos.y > 0.25, 1);
+  }
+
+  /** Enhanced cloak muffles footsteps. */
+  private silentCloak(id: string): boolean {
+    const t = tierOf(this.infos.get(id)?.abilities ?? [], 'cloak');
+    return t !== null && stat('cloak', 'silent', t) > 0;
   }
 
   onJump(): void {
@@ -964,17 +988,21 @@ export class GameClient implements PlayerHooks {
     if (m.kind === 'flash') {
       this.effects.flashPop(pos);
       audio.flashBang(pos);
-      this.applyFlash(pos, stat('flash', 'blind', m.rarity), stat('flash', 'radius', m.rarity), m.owner);
+      // Awakened flash also suppresses the enemies it blinds.
+      const suppress = m.team !== this.myTeam ? stat('flash', 'suppress', m.tier) : 0;
+      this.applyFlash(pos, stat('flash', 'blind', m.tier), stat('flash', 'radius', m.tier), m.owner, suppress);
     } else if (m.kind === 'frag') {
-      const r = stat('frag', 'radius', m.rarity);
+      const r = stat('frag', m.sub ? 'subRadius' : 'radius', m.tier);
       const ground = this.deps.map.world.groundBelow(pos.clone().setY(pos.y + 0.2), 0.05, 1.5);
       this.effects.explosion(pos, r, ground);
-      audio.explosion(pos);
+      // Bomblets burst together; one report is enough.
+      if (!m.sub || m.gid.endsWith(':0')) audio.explosion(pos);
       const d = pos.distanceTo(this.camPos);
-      this.shake = Math.min(1.2, this.shake + Math.max(0, 1 - d / 25) * 1.2);
+      this.shake = Math.min(1.2, this.shake + Math.max(0, 1 - d / 25) * (m.sub ? 0.5 : 1.2));
     } else {
-      const r = stat('smoke', 'radius', m.rarity);
-      this.smoke.spawn(m.gid, pos, r, stat('smoke', 'duration', m.rarity), m.owner, m.team, m.syn.includes('toxic'), this.time);
+      const r = stat('smoke', 'radius', m.tier);
+      const toxic = stat('smoke', 'dps', m.tier) > 0 || m.syn.includes('toxic');
+      this.smoke.spawn(m.gid, pos, r, stat('smoke', 'duration', m.tier), m.owner, m.team, toxic, this.time);
       this.effects.smokePopBurst(pos);
       audio.smokePop(pos);
       if (m.syn.includes('blindfog')) {
@@ -985,7 +1013,7 @@ export class GameClient implements PlayerHooks {
     }
   }
 
-  private applyFlash(pos: THREE.Vector3, maxBlind: number, radius: number, owner: string): void {
+  private applyFlash(pos: THREE.Vector3, maxBlind: number, radius: number, owner: string, suppress = 0): void {
     if (!this.local.alive) return;
     const eye = this.camPos;
     const dist = pos.distanceTo(eye);
@@ -1002,6 +1030,10 @@ export class GameClient implements PlayerHooks {
     this.deps.renderer.captureAfterimage();
     this.local.blind(dur);
     this.deps.audio.tinnitus(dur * 0.8, Math.min(1, strength));
+    if (suppress > 0 && dur >= 0.6) {
+      this.local.suppress(suppress);
+      this.deps.ui.hud.toast(`제압됨 · ${suppress}초간 능력 사용 불가`, 'warn', 2);
+    }
     if (owner !== this.selfId) this.net.toHost({ t: 'flashed', by: owner, duration: dur });
   }
 
@@ -1145,7 +1177,7 @@ export class GameClient implements PlayerHooks {
         const cloaked = (r.flags & F.cloak) !== 0;
         const ally = info?.team === this.myTeam;
         r.avatar.setCloaked(cloaked, ally ? 3.0 : 1);
-        if (ev.step) audio.footstep(r.pos, r.pos.y > 0.25, 1);
+        if (ev.step && !(cloaked && this.silentCloak(r.id))) audio.footstep(r.pos, r.pos.y > 0.25, 1);
         if (ev.land) audio.land(r.pos, 8);
         if (ev.jump) audio.jump(r.pos);
         if (r.flags & F.adrenaline && Math.random() < dt * 12) this.effects.speedLine(r.pos.clone().setY(r.pos.y + 0.3 + Math.random() * 1.3), [3, 1.3, 0.4]);
@@ -1361,11 +1393,11 @@ export class GameClient implements PlayerHooks {
     const a = l.ammo.get(l.current);
     const abilities: HudAbility[] = l.abilities.map((ab) => {
       let active = 0;
-      if (ab.id === 'infinite' && l.infiniteT > 0) active = l.infiniteT / stat('infinite', 'duration', ab.rarity);
-      if (ab.id === 'adrenaline' && l.adrenalineT > 0) active = l.adrenalineT / stat('adrenaline', 'duration', ab.rarity);
-      if (ab.id === 'cloak' && l.cloakT > 0) active = l.cloakT / stat('cloak', 'duration', ab.rarity);
-      const rc = ab.id === 'dash' ? stat('dash', 'recharge', ab.rarity) : 0;
-      return { id: ab.id, rarity: ab.rarity, charges: ab.charges, max: ab.max, recharge: rc > 0 ? ab.recharge / rc : 0, active: clamp(active, 0, 1) };
+      if (ab.id === 'infinite' && l.infiniteT > 0) active = l.infiniteT / stat('infinite', 'duration', ab.tier);
+      if (ab.id === 'adrenaline' && l.adrenalineT > 0) active = l.adrenalineT / stat('adrenaline', 'duration', ab.tier);
+      if (ab.id === 'cloak' && l.cloakT > 0) active = l.cloakT / stat('cloak', 'duration', ab.tier);
+      const rc = stat(ab.id, 'recharge', ab.tier);
+      return { id: ab.id, tier: ab.tier, charges: ab.charges, max: ab.max, recharge: rc > 0 ? ab.recharge / rc : 0, active: clamp(active, 0, 1) };
     });
     // Crosshair spread in pixels from the angular spread.
     const cam = this.deps.renderer.camera;
@@ -1405,6 +1437,9 @@ export class GameClient implements PlayerHooks {
         buyPhase: this.phase === 'buy' && !ui.shop.open && l.alive,
         adrenaline: l.adrenalineT,
         cloak: l.cloakT,
+        suppressed: l.alive ? l.suppressT : 0,
+        slowed: l.alive ? l.slowT : 0,
+        vulnerable: l.alive ? Math.max(0, (this.vulnUntil - now) / 1000) : 0,
       },
       dt,
     );

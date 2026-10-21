@@ -1,6 +1,6 @@
 import { h, setStyle, setText, toggleClass, clear } from './dom';
 import { ABILITY_ICONS, ICONS, WEAPON_ICONS } from './icons';
-import { ABILITIES, RARITIES, type AbilityId, type Rarity, type SynergyDef } from '../game/abilities';
+import { ABILITIES, TIERS, type AbilityId, type SynergyDef, type Tier } from '../game/abilities';
 import { WEAPONS, type WeaponId } from '../game/weapons';
 import { TEAMS, type TeamId } from '../core/config';
 import { KEY_LABEL, BINDINGS } from '../core/input';
@@ -9,7 +9,7 @@ import type { RadarRect } from '../world/map';
 
 export interface HudAbility {
   id: AbilityId;
-  rarity: Rarity;
+  tier: Tier;
   charges: number;
   max: number;
   recharge: number;
@@ -46,6 +46,10 @@ export interface HudState {
   buyPhase: boolean;
   adrenaline: number;
   cloak: number;
+  /** Seconds left on debuffs (0 = none). */
+  suppressed: number;
+  slowed: number;
+  vulnerable: number;
 }
 
 export interface NameTag {
@@ -349,7 +353,7 @@ export class Hud {
     }
 
     // Abilities
-    const key = s.abilities.map((a) => `${a.id}${a.rarity}`).join(',');
+    const key = s.abilities.map((a) => `${a.id}${a.tier}`).join(',');
     if (key !== this.lastAbilityKey) {
       this.lastAbilityKey = key;
       this.buildAbilities(s.abilities);
@@ -365,6 +369,7 @@ export class Hud {
       toggleClass(el.root, 'active', a.active > 0);
       setStyle(el.active, 'transform', `scaleX(${a.active})`);
     });
+    toggleClass(E.abilities, 'suppressed', s.suppressed > 0);
 
     // Crosshair
     const gap = Math.round(s.spread);
@@ -388,6 +393,9 @@ export class Hud {
     if (s.adrenaline > 0) fx.push(`<span class="fx adren">아드레날린 ${s.adrenaline.toFixed(1)}s</span>`);
     if (s.cloak > 0) fx.push(`<span class="fx cloak">광학 위장 ${s.cloak.toFixed(1)}s</span>`);
     if (s.infinite) fx.push('<span class="fx inf">무한 탄창</span>');
+    if (s.suppressed > 0) fx.push(`<span class="fx bad">제압 ${s.suppressed.toFixed(1)}s</span>`);
+    if (s.slowed > 0) fx.push(`<span class="fx bad">둔화 ${s.slowed.toFixed(1)}s</span>`);
+    if (s.vulnerable > 0) fx.push(`<span class="fx bad">약점 노출 ${s.vulnerable.toFixed(1)}s</span>`);
     const fxHtml = fx.join('');
     if (E.effects.innerHTML !== fxHtml) E.effects.innerHTML = fxHtml;
 
@@ -403,13 +411,15 @@ export class Hud {
     this.abilityEls = [];
     const keys = [BINDINGS.ability1[0], BINDINGS.ability2[0], BINDINGS.ability3[0]];
     list.forEach((a, i) => {
-      const r = RARITIES[a.rarity];
+      const tr = TIERS[a.tier];
+      const def = ABILITIES[a.id];
       const icon = h('div', { class: 'ab-icon', html: ABILITY_ICONS[a.id] });
       const charges = h('div', { class: 'ab-charges' });
       const cd = h('div', { class: 'ab-cd' });
       const keyEl = h('div', { class: 'ab-key' }, KEY_LABEL[keys[i]] ?? keys[i]);
       const active = h('div', { class: 'ab-active' });
-      const root = h('div', { class: `ability rarity-${a.rarity}`, style: `--rc:${r.color}`, title: `${ABILITIES[a.id].name} (${r.name})` }, cd, icon, keyEl, charges, active, h('div', { class: 'ab-name' }, ABILITIES[a.id].name));
+      const tierEl = h('div', { class: 'ab-tier' }, tr.roman);
+      const root = h('div', { class: `ability tier-${a.tier}`, style: `--rc:${tr.color}`, title: `${def.name} ${tr.roman} · ${def.tiers[a.tier].title}\n${def.describe(a.tier)}` }, cd, icon, keyEl, tierEl, charges, active, h('div', { class: 'ab-name' }, def.tiers[a.tier].title));
       E.abilities.append(root);
       this.abilityEls.push({ root, icon, charges, cd, key: keyEl, active });
     });

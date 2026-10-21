@@ -1,6 +1,6 @@
 import { h, clear, setText } from './dom';
 import { ABILITY_ICONS, ICONS } from './icons';
-import { RARITIES, ABILITIES } from '../game/abilities';
+import { TIERS, ABILITIES } from '../game/abilities';
 import { TEAMS, type TeamId } from '../core/config';
 import type { PlayerInfo } from '../net/protocol';
 import { escapeHtml } from '../core/utils';
@@ -82,7 +82,7 @@ export class Scoreboard {
               h('span', {}, String(p.assists)),
               h('span', {}, String(p.damage)),
               h('span', { class: 'sb-gold' }, p.gold.toLocaleString()),
-              h('span', { class: 'sb-abs' }, ...p.abilities.map((a) => h('i', { class: 'sb-ab', style: `--rc:${RARITIES[a.rarity].color}`, title: `${ABILITIES[a.id].name} (${RARITIES[a.rarity].name})`, html: ABILITY_ICONS[a.id] }))),
+              h('span', { class: 'sb-abs' }, ...p.abilities.map((a) => h('i', { class: 'sb-ab', style: `--rc:${TIERS[a.tier].color}`, title: `${ABILITIES[a.id].name} ${TIERS[a.tier].roman} · ${ABILITIES[a.id].tiers[a.tier].title}`, html: ABILITY_ICONS[a.id] }))),
               h('span', { class: 'sb-ping' }, p.bot ? 'BOT' : `${p.ping}`),
             ),
           ),

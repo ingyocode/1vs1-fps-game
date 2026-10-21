@@ -6,7 +6,7 @@ import type { CollisionWorld } from '../world/collision';
 import { F } from '../net/protocol';
 import { CharacterMotor } from './movement';
 import { WEAPONS, damageAt, type WeaponDef, type WeaponId } from './weapons';
-import { ABILITIES, hasSynergy, stat, type AbilityId, type OwnedAbility, type Rarity, type ThrowKind } from './abilities';
+import { ABILITIES, CLOAK_FLICKER, ECHO_DELAY, SLOW_MULT, hasSynergy, stat, type AbilityId, type OwnedAbility, type ThrowKind, type Tier } from './abilities';
 import { THROW_SPEED } from './projectiles';
 
 export interface TraceResult {
@@ -30,10 +30,10 @@ export interface ShotResult {
 export interface PlayerHooks {
   trace(origin: THREE.Vector3, dir: THREE.Vector3, maxDist: number): TraceResult;
   onShot(def: WeaponDef, origin: THREE.Vector3, shots: ShotResult[], infinite: boolean): void;
-  onThrow(kind: ThrowKind, pos: THREE.Vector3, vel: THREE.Vector3, rarity: Rarity): void;
-  onAbility(id: AbilityId, rarity: Rarity): void;
-  onRecon(radius: number, duration: number): void;
-  onBarrier(pos: THREE.Vector3, yaw: number, rarity: Rarity): void;
+  onThrow(kind: ThrowKind, pos: THREE.Vector3, vel: THREE.Vector3, tier: Tier): void;
+  onAbility(id: AbilityId, tier: Tier): void;
+  onRecon(origin: THREE.Vector3, radius: number, duration: number): void;
+  onBarrier(pos: THREE.Vector3, yaw: number, tier: Tier): void;
   onFootstep(): void;
   onJump(): void;
   onLand(speed: number): void;
@@ -48,7 +48,7 @@ export interface PlayerHooks {
 
 export interface AbilitySlot {
   id: AbilityId;
-  rarity: Rarity;
+  tier: Tier;
   charges: number;
   max: number;
   recharge: number;
@@ -101,7 +101,16 @@ export class LocalPlayer {
   adrenalineT = 0;
   cloakT = 0;
   throwCd = 0;
-  private pendingThrow: { kind: ThrowKind; t: number; rarity: Rarity } | null = null;
+  /** Abilities locked by an awakened flash. */
+  suppressT = 0;
+  /** Concussed by an enhanced frag. */
+  slowT = 0;
+  /** An awakened cloak shows briefly after each shot instead of breaking. */
+  private flickerT = 0;
+  /** Awakened dash: no movement spread right after dashing. */
+  private dashAimT = 0;
+  private echo: { t: number; origin: THREE.Vector3; radius: number; duration: number } | null = null;
+  private pendingThrow: { kind: ThrowKind; t: number; tier: Tier } | null = null;
   flashT = 0;
   flashMax = 0;
   landDip = 0;
@@ -128,11 +137,11 @@ export class LocalPlayer {
   }
 
   get adrenalineMult(): number {
-    return this.adrenalineT > 0 ? stat('adrenaline', 'fire', this.rarityOf('adrenaline')) : 1;
+    return this.adrenalineT > 0 ? stat('adrenaline', 'fire', this.tierOf('adrenaline')) : 1;
   }
 
-  rarityOf(id: AbilityId): Rarity {
-    return this.owned.find((o) => o.id === id)?.rarity ?? 0;
+  tierOf(id: AbilityId): Tier {
+    return this.owned.find((o) => o.id === id)?.tier ?? 0;
   }
 
   // ---------------------------------------------------------------------------
@@ -153,14 +162,14 @@ export class LocalPlayer {
       if (!primary || this.current === 'pistol' || this.current === 'magnum') this.equip(secondary);
     }
     if (!primary && this.current !== secondary && this.current !== 'knife') this.equip(secondary);
-    // Ability rarity upgrades keep current charges but refresh maxima.
+    // Tier upgrades keep current charges but refresh maxima.
     const prev = new Map(this.abilities.map((a) => [a.id, a]));
     this.owned = abilities.map((a) => ({ ...a }));
     this.abilities = abilities.map((a) => {
-      const max = stat(a.id, 'charges', a.rarity);
+      const max = stat(a.id, 'charges', a.tier);
       const old = prev.get(a.id);
       const charges = old ? Math.min(max, old.charges + Math.max(0, max - old.max)) : max;
-      return { id: a.id, rarity: a.rarity, charges, max, recharge: old?.recharge ?? 0 };
+      return { id: a.id, tier: a.tier, charges, max, recharge: old?.recharge ?? 0 };
     });
   }
 
@@ -180,6 +189,8 @@ export class LocalPlayer {
     this.adsLatched = false;
     this.infiniteT = this.adrenalineT = this.cloakT = 0;
     this.flashT = 0;
+    this.suppressT = this.slowT = this.flickerT = this.dashAimT = 0;
+    this.echo = null;
     this.pendingThrow = null;
     for (const a of this.abilities) {
       a.charges = a.max;
@@ -256,9 +267,13 @@ export class LocalPlayer {
     this.infiniteT = Math.max(0, this.infiniteT - dt);
     this.adrenalineT = Math.max(0, this.adrenalineT - dt);
     this.cloakT = Math.max(0, this.cloakT - dt);
+    this.suppressT = Math.max(0, this.suppressT - dt);
+    this.slowT = Math.max(0, this.slowT - dt);
+    this.flickerT = Math.max(0, this.flickerT - dt);
+    this.dashAimT = Math.max(0, this.dashAimT - dt);
     this.landDip = Math.max(0, this.landDip - dt * 0.9);
     for (const a of this.abilities) {
-      const rc = a.id === 'dash' ? stat('dash', 'recharge', a.rarity) : 0;
+      const rc = stat(a.id, 'recharge', a.tier);
       if (rc > 0 && a.charges < a.max) {
         a.recharge += dt;
         if (a.recharge >= rc) {
@@ -272,7 +287,7 @@ export class LocalPlayer {
     const fwd = (inp.isDown('forward') ? 1 : 0) - (inp.isDown('back') ? 1 : 0);
     const right = (inp.isDown('right') ? 1 : 0) - (inp.isDown('left') ? 1 : 0);
     const def = this.def;
-    const speedMult = def.moveSpeed * (this.adsT > 0.5 ? PLAYER.adsMult : 1) * (this.adrenalineT > 0 ? stat('adrenaline', 'speed', this.rarityOf('adrenaline')) : 1);
+    const speedMult = def.moveSpeed * (this.adsT > 0.5 ? PLAYER.adsMult : 1) * (this.adrenalineT > 0 ? stat('adrenaline', 'speed', this.tierOf('adrenaline')) : 1) * (this.slowT > 0 ? SLOW_MULT : 1);
     const ev = this.motor.step(
       { forward: fwd, right, jump: inp.isDown('jump'), crouch: inp.isDown('crouch'), walk: inp.isDown('walk'), yaw: this.yaw },
       dt,
@@ -368,7 +383,17 @@ export class LocalPlayer {
         // Don't spawn inside a wall right in front of the player.
         const back = f.world.raycast(this.eye, dir.clone().normalize(), 0.6, false);
         if (back) pos.copy(this.eye).addScaledVector(dir.clone().normalize(), Math.max(0, back.dist - 0.15));
-        this.hooks.onThrow(pt.kind, pos, vel, pt.rarity);
+        this.hooks.onThrow(pt.kind, pos, vel, pt.tier);
+      }
+    }
+
+    // Enhanced recon: the pulse echoes from where it was fired.
+    if (this.echo) {
+      this.echo.t -= dt;
+      if (this.echo.t <= 0) {
+        const e = this.echo;
+        this.echo = null;
+        if (f.canUseAbilities) this.hooks.onRecon(e.origin, e.radius, e.duration);
       }
     }
 
@@ -422,8 +447,9 @@ export class LocalPlayer {
     if (def.slot === 'melee') return 0;
     const speed = this.motor.speed2D;
     const moveK = clamp((speed - 1.3) / (PLAYER.runSpeed - 1.3), 0, 1);
-    let s = lerp(def.spread.hip, def.spread.ads, this.adsT) + def.spread.move * moveK + this.bloom;
-    if (!this.motor.body.onGround) s += def.spread.air;
+    const precise = this.dashAimT > 0;
+    let s = lerp(def.spread.hip, def.spread.ads, this.adsT) + (precise ? 0 : def.spread.move * moveK) + this.bloom;
+    if (!this.motor.body.onGround && !precise) s += def.spread.air;
     if (this.motor.crouch > 0.5) s *= def.spread.crouch;
     return s;
   }
@@ -443,11 +469,11 @@ export class LocalPlayer {
       else if (this.current !== this.secondary) this.equip(this.secondary);
       return;
     }
-    const fireMult = this.adrenalineMult * (infinite ? stat('infinite', 'fireRate', this.rarityOf('infinite')) : 1);
+    const fireMult = this.adrenalineMult * (infinite ? stat('infinite', 'fireRate', this.tierOf('infinite')) : 1);
     this.fireCd = 60 / def.rpm / fireMult;
     if (def.bolt) this.boltT = def.bolt / this.adrenalineMult;
     if (!infinite) a.mag--;
-    if (!(infinite && hasSynergy(this.owned, 'phantom'))) this.cloakT = 0;
+    this.breakCloak();
 
     const origin = _origin.copy(this.eye);
     const view = this.viewDir;
@@ -481,7 +507,7 @@ export class LocalPlayer {
   private melee(heavy: boolean): void {
     const def = this.def;
     this.fireCd = heavy ? 1.0 : 60 / def.rpm;
-    this.cloakT = 0;
+    this.breakCloak();
     this.hooks.onMelee(heavy);
     const origin = this.eye;
     const view = this.viewDir;
@@ -515,18 +541,25 @@ export class LocalPlayer {
     this.hooks.onShot(def, origin.clone(), [{ trace: tr, dir: bestDir, damage: dmg }], false);
   }
 
+  /** Attacking reveals a cloaked player; an awakened cloak (or phantom during infinite) only flickers. */
+  private breakCloak(): void {
+    if (this.cloakT <= 0) return;
+    if (stat('cloak', 'phantom', this.tierOf('cloak')) > 0 || (this.infiniteT > 0 && hasSynergy(this.owned, 'phantom'))) this.flickerT = CLOAK_FLICKER;
+    else this.cloakT = 0;
+  }
+
   // ---------------------------------------------------------------------------
   // Abilities
   // ---------------------------------------------------------------------------
   private useAbility(slot: number, world: CollisionWorld): void {
     const a = this.abilities[slot];
-    if (!a || a.charges <= 0) return;
+    if (!a || a.charges <= 0 || this.suppressT > 0) return;
     const def = ABILITIES[a.id];
     const syn = (id: string): boolean => hasSynergy(this.owned, id);
     if (def.type === 'throw') {
       if (this.throwCd > 0 || this.pendingThrow) return;
       this.throwCd = 0.7;
-      this.pendingThrow = { kind: a.id as ThrowKind, t: 0.24, rarity: a.rarity };
+      this.pendingThrow = { kind: a.id as ThrowKind, t: 0.24, tier: a.tier };
       this.adsT = 0;
       this.reloadT = 0;
       this.shellState = null;
@@ -542,16 +575,22 @@ export class LocalPlayer {
             dx = -Math.sin(this.yaw);
             dz = -Math.cos(this.yaw);
           }
-          this.motor.startDash(dx, dz, stat('dash', 'distance', a.rarity));
+          this.motor.startDash(dx, dz, stat('dash', 'distance', a.tier));
+          if (stat('dash', 'aim', a.tier) > 0) this.dashAimT = 1.2;
           if (syn('shadowstep')) this.cloakT = Math.max(this.cloakT, 1.5);
           break;
         }
         case 'heal':
           if (syn('secondwind')) this.adrenalineT = Math.max(this.adrenalineT, 3);
           break;
-        case 'recon':
-          this.hooks.onRecon(stat('recon', 'radius', a.rarity), stat('recon', 'reveal', a.rarity));
+        case 'recon': {
+          const origin = this.eye;
+          const radius = stat('recon', 'radius', a.tier);
+          const duration = stat('recon', 'reveal', a.tier);
+          this.hooks.onRecon(origin, radius, duration);
+          if (stat('recon', 'echo', a.tier) > 0) this.echo = { t: ECHO_DELAY, origin, radius, duration };
           break;
+        }
         case 'barrier': {
           const flat = new THREE.Vector3(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
           const eye = this.eye;
@@ -562,23 +601,25 @@ export class LocalPlayer {
           const g = world.groundBelow(new THREE.Vector3(p.x, p.y + 1.2, p.z), 0.05, 4);
           if (g !== null) p.y = g;
           const yaw = Math.abs(flat.z) >= Math.abs(flat.x) ? 0 : Math.PI / 2;
-          this.hooks.onBarrier(p, yaw, a.rarity);
+          this.hooks.onBarrier(p, yaw, a.tier);
           break;
         }
         case 'cloak':
-          this.cloakT = stat('cloak', 'duration', a.rarity);
+          this.cloakT = stat('cloak', 'duration', a.tier);
+          this.flickerT = 0;
           break;
         case 'adrenaline':
-          this.adrenalineT = stat('adrenaline', 'duration', a.rarity);
-          if (syn('berserk')) this.infiniteT = Math.max(this.infiniteT, stat('infinite', 'duration', this.rarityOf('infinite')) * 0.6);
+          this.adrenalineT = stat('adrenaline', 'duration', a.tier);
+          if (stat('adrenaline', 'reload', a.tier) > 0) this.instantReload();
+          if (syn('berserk')) this.infiniteT = Math.max(this.infiniteT, stat('infinite', 'duration', this.tierOf('infinite')) * 0.6);
           break;
         case 'infinite': {
-          this.infiniteT = stat('infinite', 'duration', a.rarity);
+          this.infiniteT = stat('infinite', 'duration', a.tier);
           const am = this.ammo.get(this.current);
           if (am && this.def.slot !== 'melee') am.mag = Math.max(am.mag, this.def.mag);
           this.reloadT = 0;
           this.shellState = null;
-          if (syn('berserk')) this.adrenalineT = Math.max(this.adrenalineT, stat('adrenaline', 'duration', this.rarityOf('adrenaline')) * 0.6);
+          if (syn('berserk')) this.adrenalineT = Math.max(this.adrenalineT, stat('adrenaline', 'duration', this.tierOf('adrenaline')) * 0.6);
           break;
         }
         default:
@@ -586,7 +627,39 @@ export class LocalPlayer {
       }
     }
     a.charges--;
-    this.hooks.onAbility(a.id, a.rarity);
+    this.hooks.onAbility(a.id, a.tier);
+  }
+
+  private instantReload(): void {
+    if (this.def.slot === 'melee') return;
+    this.reloadT = 0;
+    this.shellState = null;
+    this.reloadEvents = [];
+    this.finishReload();
+  }
+
+  /** Kill rewards of awakened abilities. Returns a toast line when something triggered. */
+  onKill(): string | null {
+    const notes: string[] = [];
+    const dash = this.abilities.find((a) => a.id === 'dash');
+    if (dash && stat('dash', 'aim', dash.tier) > 0 && dash.charges < dash.max) {
+      dash.charges++;
+      notes.push('칼바람 · 대시 충전');
+    }
+    const adr = this.tierOf('adrenaline');
+    if (this.adrenalineT > 0 && stat('adrenaline', 'killHeal', adr) > 0) {
+      this.adrenalineT = stat('adrenaline', 'duration', adr);
+      notes.push(`폭주 · 체력 +${stat('adrenaline', 'killHeal', adr)}`);
+    }
+    return notes.length ? notes.join(' · ') : null;
+  }
+
+  suppress(duration: number): void {
+    this.suppressT = Math.max(this.suppressT, duration);
+  }
+
+  slow(duration: number): void {
+    this.slowT = Math.max(this.slowT, duration);
   }
 
   // ---------------------------------------------------------------------------
@@ -595,7 +668,7 @@ export class LocalPlayer {
     if (this.motor.crouch > 0.5) f |= F.crouch;
     if (this.adsT > 0.5) f |= F.ads;
     if (this.motor.body.onGround) f |= F.ground;
-    if (this.cloakT > 0) f |= F.cloak;
+    if (this.cloakT > 0 && this.flickerT <= 0) f |= F.cloak;
     if (this.adrenalineT > 0) f |= F.adrenaline;
     if (this.infiniteT > 0) f |= F.infinite;
     if (this.reloading) f |= F.reload;

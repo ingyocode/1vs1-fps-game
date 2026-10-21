@@ -1,8 +1,8 @@
 import type { TeamId, HitZone } from '../core/config';
 import type { WeaponId } from '../game/weapons';
-import type { AbilityId, DraftCard, OwnedAbility, Rarity, ThrowKind } from '../game/abilities';
+import type { AbilityId, DraftCard, OwnedAbility, ThrowKind, Tier } from '../game/abilities';
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 export type V3 = [number, number, number];
 export type Phase = 'lobby' | 'draft' | 'buy' | 'live' | 'roundEnd' | 'matchEnd';
@@ -87,8 +87,10 @@ export interface ThrowMsg {
   team: TeamId;
   pos: V3;
   vel: V3;
-  rarity: Rarity;
+  tier: Tier;
   syn: string[];
+  /** Cluster bomblet: spawned locally by every simulation on detonation, never sent. */
+  sub?: boolean;
 }
 
 export interface BarrierMsg {
@@ -120,7 +122,7 @@ export type HostMsg =
   | { t: 'coins'; list: CoinInfo[] }
   | { t: 'coinTaken'; id: number; by: string; value: number }
   | { t: 'fire'; id: string; w: WeaponId; o: V3; hits: ShotHit[] }
-  | { t: 'dmg'; target: string; attacker: string; amount: number; hp: number; armor: number; zone: HitZone | 'blast' | 'toxic'; from: V3; w: WeaponId | AbilityId }
+  | { t: 'dmg'; target: string; attacker: string; amount: number; hp: number; armor: number; zone: HitZone | 'blast' | 'toxic' | 'shock'; from: V3; w: WeaponId | AbilityId }
   | { t: 'kill'; killer: string; victim: string; w: WeaponId | AbilityId; head: boolean; assister: string | null }
   | { t: 'heal'; target: string; hp: number; armor: number }
   | ThrowMsg
@@ -128,7 +130,8 @@ export type HostMsg =
   | BarrierMsg
   | { t: 'barrierHp'; bid: string; hp: number }
   | { t: 'barrierGone'; bid: string }
-  | { t: 'reveal'; team: TeamId; targets: string[]; duration: number; origin?: V3; kind: 'pulse' | 'mark' }
+  | { t: 'reveal'; team: TeamId; targets: string[]; duration: number; origin?: V3; kind: 'pulse' | 'mark'; vuln?: boolean }
+  | { t: 'debuff'; target: string; kind: 'slow' | 'vuln'; duration: number }
   | { t: 'gold'; amount: number; reason: string }
   | { t: 'roundEnd'; winner: TeamId | -1; reason: 'elimination' | 'time' | 'forfeit'; scores: [number, number]; mvp: string | null }
   | { t: 'matchEnd'; winner: TeamId; scores: [number, number] }

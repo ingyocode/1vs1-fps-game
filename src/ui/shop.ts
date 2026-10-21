@@ -1,7 +1,7 @@
 import { h, clear, setText } from './dom';
 import { ABILITY_ICONS, ICONS, WEAPON_ICONS } from './icons';
 import { ARMOR_ITEMS, PRIMARY_IDS, SECONDARY_IDS, WEAPONS, type WeaponId } from '../game/weapons';
-import { ABILITIES, RARITIES, UPGRADE_COST, activeSynergies } from '../game/abilities';
+import { ABILITIES, MAX_TIER, TIERS, UPGRADE_COST, activeSynergies, type Tier } from '../game/abilities';
 import type { PlayerInfo } from '../net/protocol';
 import type { AudioEngine } from '../audio/audio';
 
@@ -95,16 +95,28 @@ export class ShopView {
           '능력 강화',
           me.abilities.length
             ? me.abilities.map((ab) => {
-                const r = RARITIES[ab.rarity];
-                const max = ab.rarity >= 3;
-                const cost = max ? 0 : UPGRADE_COST[ab.rarity as 0 | 1 | 2];
-                const next = max ? null : RARITIES[ab.rarity + 1];
+                const def = ABILITIES[ab.id];
+                const tr = TIERS[ab.tier];
+                const max = ab.tier >= MAX_TIER;
+                const cost = max ? 0 : UPGRADE_COST[ab.tier as 0 | 1];
+                const nextTier = (max ? ab.tier : ab.tier + 1) as Tier;
+                const next = TIERS[nextTier];
                 return h(
                   'button',
-                  { class: `shop-item upgrade ${max ? 'owned' : ''} ${!max && me.gold < cost ? 'poor' : ''}`, style: `--rc:${r.color}`, onclick: () => this.buy(`up:${ab.id}`), onmouseenter: () => this.audio.uiHover() },
+                  {
+                    class: `shop-item upgrade ${max ? 'owned' : ''} ${!max && me.gold < cost ? 'poor' : ''}`,
+                    style: `--rc:${tr.color}`,
+                    title: `${next.roman} ${def.tiers[nextTier].title}\n${def.describe(nextTier)}`,
+                    onclick: () => this.buy(`up:${ab.id}`),
+                    onmouseenter: () => this.audio.uiHover(),
+                  },
                   h('div', { class: 'si-icon', html: ABILITY_ICONS[ab.id] }),
-                  h('div', { class: 'si-name' }, ABILITIES[ab.id].name),
-                  h('div', { class: 'si-desc' }, max ? `${r.name} (최대)` : h('span', {}, h('em', { style: `color:${r.color}` }, r.name), ' → ', h('em', { style: `color:${next!.color}` }, next!.name))),
+                  h('div', { class: 'si-name' }, def.name),
+                  h(
+                    'div',
+                    { class: 'si-desc' },
+                    max ? `${tr.roman} ${def.tiers[ab.tier].title} (각성)` : h('span', {}, h('em', { style: `color:${tr.color}` }, tr.roman), ' → ', h('em', { style: `color:${next.color}` }, `${next.roman} ${def.tiers[nextTier].title}`)),
+                  ),
                   h('div', { class: 'si-price' }, max ? 'MAX' : `${cost} G`),
                 );
               })

@@ -1,6 +1,6 @@
 import { h, clear, setText } from './dom';
 import { ABILITY_ICONS } from './icons';
-import { ABILITIES, RARITIES, activeSynergies, synergyPartners, type DraftCard, type OwnedAbility } from '../game/abilities';
+import { ABILITIES, MAX_TIER, TIERS, activeSynergies, synergyPartners, type DraftCard, type OwnedAbility, type Tier } from '../game/abilities';
 import type { AudioEngine } from '../audio/audio';
 
 const TYPE_LABEL = { throw: '투척', self: '자가 강화', deploy: '설치' } as const;
@@ -59,7 +59,7 @@ export class DraftView {
         { class: 'draft-head' },
         h('div', { class: 'draft-kicker' }, 'ABILITY DRAFT'),
         this.titleEl,
-        h('div', { class: 'draft-sub' }, '카드 한 장을 고르세요. 같은 능력을 다시 고르면 희귀도가 진화하고, 특정 조합은 시너지를 발동합니다.'),
+        h('div', { class: 'draft-sub' }, '카드 한 장을 고르세요. 보유한 능력은 다음 단계 강화 카드로 등장하며 Ⅲ단계에서 각성합니다. 특정 조합은 시너지를 발동합니다.'),
         h('div', { class: 'draft-timer' }, svg as unknown as HTMLElement, this.timerEl),
       ),
       this.cardsEl,
@@ -80,32 +80,38 @@ export class DraftView {
     setText(this.titleEl, `능력 선택 ${pick} / ${total}`);
     clear(this.cardsEl);
     cards.forEach((c, i) => this.cardsEl.append(this.renderCard(c, i, owned)));
-    cards.forEach((c, i) => this.audio.cardReveal(c.rarity, 0.12 + i * 0.16));
+    cards.forEach((c, i) => this.audio.cardReveal(c.tier + 1, 0.12 + i * 0.16));
     this.renderHand(owned);
   }
 
   private renderCard(c: DraftCard, i: number, owned: OwnedAbility[]): HTMLElement {
     const def = ABILITIES[c.ability];
-    const r = RARITIES[c.rarity];
-    const have = owned.find((o) => o.id === c.ability);
-    const evolveTo = have ? Math.min(3, Math.max(have.rarity, c.rarity) + 1) : null;
-    const shownRarity = (evolveTo ?? c.rarity) as 0 | 1 | 2 | 3;
-    const stats = def.statLines(shownRarity);
+    const tr = TIERS[c.tier];
+    const step = def.tiers[c.tier];
+    const upgrade = c.tier > 0;
+    const stats = def.statLines(c.tier);
+    const prev = upgrade ? def.statLines((c.tier - 1) as Tier) : null;
     const partners = synergyPartners(c.ability);
     const inner = h(
       'div',
       { class: 'card-inner' },
       h('div', { class: 'card-shine' }),
-      h('div', { class: 'card-head' }, h('span', { class: 'rarity-tag' }, `${r.name} · ${r.nameEn}`), h('span', { class: 'type-tag' }, TYPE_LABEL[def.type])),
+      h('div', { class: 'card-head' }, h('span', { class: 'rarity-tag' }, upgrade ? `${tr.roman} ${tr.name} · ${tr.nameEn}` : '신규 · NEW'), h('span', { class: 'type-tag' }, TYPE_LABEL[def.type])),
       h('div', { class: 'card-icon', html: ABILITY_ICONS[c.ability] }),
-      h('div', { class: 'card-name' }, def.name),
-      h('div', { class: 'card-en' }, def.nameEn),
-      h('div', { class: 'card-tagline' }, def.tagline),
-      h('div', { class: 'card-desc' }, def.describe(shownRarity)),
-      h('div', { class: 'card-stats' }, ...stats.map(([k, v]) => h('div', { class: 'stat-row' }, h('span', {}, k), h('b', {}, v)))),
-      evolveTo !== null
-        ? h('div', { class: 'card-evolve', style: `--ec:${RARITIES[evolveTo].color}` }, `진화! ${RARITIES[have!.rarity].name} → ${RARITIES[evolveTo].name}`)
-        : null,
+      h('div', { class: 'card-name' }, step.title),
+      h('div', { class: 'card-en' }, upgrade ? `${def.name} 강화` : def.nameEn),
+      h('div', { class: 'card-pips' }, ...TIERS.map((t, k) => h('i', { class: k < c.tier ? 'done' : k === c.tier ? 'now' : '', title: `${t.roman} ${def.tiers[k].title}` }))),
+      upgrade ? h('div', { class: 'card-perks' }, ...step.perks.map((pk) => h('div', { class: 'perk' }, pk))) : h('div', { class: 'card-desc' }, def.describe(0)),
+      h(
+        'div',
+        { class: 'card-stats' },
+        ...stats.map(([k, v], j) => {
+          const old = prev?.[j]?.[1];
+          return h('div', { class: 'stat-row' }, h('span', {}, k), old !== undefined && old !== v ? h('b', {}, h('s', {}, old), ` → ${v}`) : h('b', {}, v));
+        }),
+      ),
+      // A fresh card previews where the ability grows, so the pick can be planned.
+      upgrade ? null : h('div', { class: 'card-path' }, def.tiers.slice(1, MAX_TIER + 1).map((t, k) => `${TIERS[k + 1].roman} ${t.title}`).join('  →  ')),
       h(
         'div',
         { class: 'card-syn' },
@@ -116,7 +122,7 @@ export class DraftView {
       ),
       h('div', { class: 'card-key' }, String(i + 1)),
     );
-    const card = h('div', { class: `card rarity-${shownRarity}`, style: `--rc:${RARITIES[shownRarity].color}; --delay:${0.08 + i * 0.14}s` }, inner);
+    const card = h('div', { class: `card tier-${c.tier}${upgrade ? ' upgrade' : ''}`, style: `--rc:${tr.color}; --delay:${0.08 + i * 0.14}s` }, inner);
     card.addEventListener('mousemove', (e) => {
       const rect = card.getBoundingClientRect();
       const x = (e.clientX - rect.left) / rect.width - 0.5;
@@ -137,8 +143,9 @@ export class DraftView {
     clear(this.handEl);
     if (owned.length === 0) this.handEl.append(h('div', { class: 'hand-empty' }, '아직 없음'));
     for (const o of owned) {
-      const r = RARITIES[o.rarity];
-      this.handEl.append(h('div', { class: 'hand-chip', style: `--rc:${r.color}` }, h('span', { class: 'hand-ico', html: ABILITY_ICONS[o.id] }), ABILITIES[o.id].name, h('em', {}, r.name)));
+      const tr = TIERS[o.tier];
+      const def = ABILITIES[o.id];
+      this.handEl.append(h('div', { class: 'hand-chip', style: `--rc:${tr.color}`, title: def.describe(o.tier) }, h('span', { class: 'hand-ico', html: ABILITY_ICONS[o.id] }), def.tiers[o.tier].title, h('em', {}, tr.roman)));
     }
     clear(this.synEl);
     for (const sy of activeSynergies(owned)) this.synEl.append(h('div', { class: 'syn-chip big', title: sy.desc }, `⟡ ${sy.name}`, h('span', {}, sy.desc)));

@@ -22,7 +22,7 @@ import {
 import type { GameMap } from '../world/map';
 import { segmentHitsSphere } from '../world/collision';
 import { ARMOR_ITEMS, WEAPONS, applyArmor, type WeaponId } from './weapons';
-import { ABILITIES, UPGRADE_COST, applyPick, hasSynergy, rollOffer, stat, type AbilityId, type DraftCard, type Rarity } from './abilities';
+import { ABILITIES, MAX_TIER, TIERS, TOXIC_SYN_DPS, UPGRADE_COST, VULN_BONUS, applyPick, hasSynergy, rollOffer, stat, tierOf, type AbilityId, type DraftCard, type Tier } from './abilities';
 import { Hitbox } from './hitbox';
 import { ProjectileSystem, type Grenade } from './projectiles';
 import { NavGraph } from './nav';
@@ -47,6 +47,10 @@ export interface HostPlayer {
   spawnPos: THREE.Vector3;
   spawnLockUntil: number;
   lastSeq: number;
+  /** Exposed by an awakened recon pulse: takes extra damage until then. */
+  vulnUntil: number;
+  /** Awakened heal: the once-per-round lethal-hit save is still available. */
+  lastStand: boolean;
 }
 
 interface HostSmoke {
@@ -56,7 +60,8 @@ interface HostSmoke {
   duration: number;
   owner: string;
   team: TeamId;
-  toxic: boolean;
+  /** Poison per second dealt to enemies inside (0 = plain smoke). */
+  dps: number;
   tick: number;
 }
 
@@ -174,6 +179,8 @@ export class MatchHost {
       spawnPos: new THREE.Vector3(),
       spawnLockUntil: 0,
       lastSeq: 0,
+      vulnUntil: 0,
+      lastStand: false,
     };
     if (bot) p.bot = new BotBrain(p, this);
     this.players.set(id, p);
@@ -359,10 +366,14 @@ export class MatchHost {
       case 'coin':
         this.onCoin(p, msg.id);
         break;
-      case 'throw':
+      case 'throw': {
         if (!p.info.alive || this.phase !== 'live') return;
-        this.onThrow(msg, from);
+        // The tier comes from the roster, not the sender; bomblets are never sent.
+        const tier = tierOf(p.info.abilities, msg.kind);
+        if (tier === null) return;
+        this.onThrow({ ...msg, tier, sub: false }, from);
         break;
+      }
       case 'ability':
         if (!p.info.alive) return;
         this.onAbility(p, msg.ability);
@@ -373,11 +384,10 @@ export class MatchHost {
         this.addBarrier(msg);
         break;
       case 'barrierDmg':
-        this.damageBarrier(msg.bid, msg.dmg);
+        this.damageBarrier(msg.bid, msg.dmg, p);
         break;
       case 'reveal':
-        this.net.broadcast({ t: 'reveal', team: p.info.team, targets: msg.targets, duration: Math.min(6, msg.duration), origin: msg.origin, kind: msg.kind });
-        this.feedBotsReveal(p.info.team, msg.targets);
+        this.pulseReveal(p, msg.targets, msg.duration, msg.origin, msg.kind);
         break;
       case 'flashed': {
         const thrower = this.players.get(msg.by);
@@ -452,7 +462,7 @@ export class MatchHost {
   onDraftPick(p: HostPlayer, index: number): void {
     if (this.phase !== 'draft' || p.draftPicked || !p.draftOffer) return;
     const card = p.draftOffer[Math.max(0, Math.min(p.draftOffer.length - 1, index | 0))];
-    p.info.abilities = applyPick(p.info.abilities, card).list;
+    p.info.abilities = applyPick(p.info.abilities, card);
     p.draftPicked = true;
     this.playersDirty = true;
     if (!p.bot) this.net.sendTo(p.info.id, { t: 'draftWait' });
@@ -479,6 +489,7 @@ export class MatchHost {
         p.dmgFrom.clear();
         p.hot = null;
         p.flashedUntil = 0;
+        p.vulnUntil = 0;
         p.hitbox.update(p.pos, p.yaw, 0);
         spawns.push({ id: p.info.id, pos: v3(sp.pos), yaw: sp.yaw });
       });
@@ -514,7 +525,12 @@ export class MatchHost {
       }
     }
     this.net.broadcast({ t: 'coins', list: [...this.coins.values()] });
-    for (const p of this.players.values()) p.bot?.onLive();
+    for (const p of this.players.values()) {
+      // Armed at go-live so a heal upgraded in the shop this round counts.
+      const heal = tierOf(p.info.abilities, 'heal');
+      p.lastStand = heal !== null && stat('heal', 'lastStand', heal) > 0;
+      p.bot?.onLive();
+    }
   }
 
   private endRound(winner: TeamId | -1, reason: 'elimination' | 'time' | 'forfeit'): void {
@@ -606,11 +622,11 @@ export class MatchHost {
       const id = item.slice(3) as AbilityId;
       const owned = p.info.abilities.find((a) => a.id === id);
       if (!owned) return fail('보유하지 않은 능력입니다.');
-      if (owned.rarity >= 3) return fail('이미 전설 등급입니다.');
-      cost = UPGRADE_COST[owned.rarity as 0 | 1 | 2];
+      if (owned.tier >= MAX_TIER) return fail('이미 각성 단계입니다.');
+      cost = UPGRADE_COST[owned.tier as 0 | 1];
       if (p.info.gold < cost) return fail('골드가 부족합니다.');
-      owned.rarity = (owned.rarity + 1) as Rarity;
-      done = `${ABILITIES[id].name} 강화`;
+      owned.tier = (owned.tier + 1) as Tier;
+      done = `${ABILITIES[id].name} ${TIERS[owned.tier].roman} · ${ABILITIES[id].tiers[owned.tier].title}`;
     } else return fail('알 수 없는 품목');
     p.info.gold -= cost;
     this.playersDirty = true;
@@ -648,9 +664,18 @@ export class MatchHost {
     this.applyDamage(target, p, dmg, zone, w, def.armorPen);
   }
 
-  applyDamage(target: HostPlayer, attacker: HostPlayer | null, raw: number, zone: HitZone | 'blast' | 'toxic', w: WeaponId | AbilityId, armorPen = 0.5): void {
-    if (!target.info.alive || this.phase !== 'live') return;
+  /** Returns the health actually removed. */
+  applyDamage(target: HostPlayer, attacker: HostPlayer | null, raw: number, zone: HitZone | 'blast' | 'toxic' | 'shock', w: WeaponId | AbilityId, armorPen = 0.5): number {
+    if (!target.info.alive || this.phase !== 'live') return 0;
+    const hostile = attacker !== null && attacker !== target && attacker.info.team !== target.info.team;
+    if (hostile && target.vulnUntil > now()) raw *= 1 + VULN_BONUS;
     const r = applyArmor(raw, target.info.armor, armorPen);
+    // Awakened heal: once per round a non-headshot lethal hit leaves 1 HP instead.
+    const saved = r.hp >= target.info.hp && target.lastStand && zone !== 'head';
+    if (saved) {
+      target.lastStand = false;
+      r.hp = Math.max(0, target.info.hp - 1);
+    }
     const hpDmg = Math.min(target.info.hp, r.hp);
     target.info.armor = Math.max(0, target.info.armor - r.armor);
     target.info.hp = Math.max(0, target.info.hp - r.hp);
@@ -664,7 +689,18 @@ export class MatchHost {
     const from = attacker ? attacker.hitbox.head : target.hitbox.center;
     this.net.broadcast({ t: 'dmg', target: target.info.id, attacker: aId, amount: Math.round(r.hp), hp: Math.ceil(target.info.hp), armor: Math.round(target.info.armor), zone, from: v3(from), w });
     target.bot?.onDamaged(attacker);
+    if (saved) {
+      this.startHeal(target, tierOf(target.info.abilities, 'heal') ?? MAX_TIER);
+      this.net.broadcast({ t: 'ability', id: target.info.id, ability: 'heal', data: [1] });
+    }
+    // Awakened infinite: weapon damage dealt while bottomless heals the shooter.
+    if (hostile && attacker.info.alive && w in WEAPONS && (attacker.flags & F.infinite) !== 0) {
+      const inf = tierOf(attacker.info.abilities, 'infinite');
+      const ls = inf === null ? 0 : stat('infinite', 'lifesteal', inf);
+      if (ls > 0) attacker.info.hp = Math.min(PLAYER.maxHp, attacker.info.hp + hpDmg * ls);
+    }
     if (target.info.hp <= 0) this.kill(target, attacker, w, zone === 'head');
+    return hpDmg;
   }
 
   private kill(victim: HostPlayer, killer: HostPlayer | null, w: WeaponId | AbilityId, head: boolean): void {
@@ -694,6 +730,10 @@ export class MatchHost {
         a.info.assists++;
         this.giveGold(a, ECON.assist, '어시스트');
       }
+      // Awakened adrenaline: a kill while boosted heals (the duration refresh is local to the killer).
+      const adr = tierOf(killer.info.abilities, 'adrenaline');
+      if (adr !== null && killer.info.alive && (killer.flags & F.adrenaline) !== 0) killer.info.hp = Math.min(PLAYER.maxHp, killer.info.hp + stat('adrenaline', 'killHeal', adr));
+      killer.bot?.onKill();
     }
     this.net.broadcast({ t: 'kill', killer: killer?.info.id ?? victim.info.id, victim: victim.info.id, w, head, assister });
     this.playersDirty = true;
@@ -725,8 +765,32 @@ export class MatchHost {
   // ---------------------------------------------------------------------------
   // Abilities
   // ---------------------------------------------------------------------------
-  private abilityRarity(p: HostPlayer, id: AbilityId): Rarity | null {
-    return p.info.abilities.find((a) => a.id === id)?.rarity ?? null;
+  private abilityTier(p: HostPlayer, id: AbilityId): Tier | null {
+    return tierOf(p.info.abilities, id);
+  }
+
+  /** Applies a timed debuff: humans are told about it, bots track it themselves. */
+  private debuff(p: HostPlayer, kind: 'slow' | 'vuln', duration: number): void {
+    if (p.bot) {
+      if (kind === 'slow') p.bot.slow(duration);
+    } else this.net.sendTo(p.info.id, { t: 'debuff', target: p.info.id, kind, duration });
+  }
+
+  /** Recon pulse (players and bots). An awakened pulse also leaves the targets vulnerable. */
+  pulseReveal(p: HostPlayer, targets: string[], duration: number, origin: V3 | undefined, kind: 'pulse' | 'mark'): void {
+    const dur = Math.min(6, duration);
+    const t = this.abilityTier(p, 'recon');
+    const vuln = kind === 'pulse' && t !== null && stat('recon', 'vuln', t) > 0;
+    if (vuln) {
+      for (const id of targets) {
+        const e = this.players.get(id);
+        if (!e || !e.info.alive || e.info.team === p.info.team) continue;
+        e.vulnUntil = Math.max(e.vulnUntil, now() + dur * 1000);
+        this.debuff(e, 'vuln', dur);
+      }
+    }
+    this.net.broadcast({ t: 'reveal', team: p.info.team, targets, duration: dur, origin, kind, vuln });
+    this.feedBotsReveal(p.info.team, targets);
   }
 
   /** Relays a throw to everyone except the thrower (who already simulates it) and simulates it here too. */
@@ -736,16 +800,18 @@ export class MatchHost {
   }
 
   onAbility(p: HostPlayer, ability: AbilityId): void {
-    const r = this.abilityRarity(p, ability);
-    if (r === null) return;
-    if (ability === 'heal') {
-      const amount = stat('heal', 'amount', r);
-      p.hot = { left: 3, perSec: amount / 3 };
-      const armor = stat('heal', 'armor', r);
-      if (armor > 0) p.info.armor = Math.min(PLAYER.maxArmor, p.info.armor + armor);
-      this.playersDirty = true;
-    }
+    const t = this.abilityTier(p, ability);
+    if (t === null) return;
+    if (ability === 'heal') this.startHeal(p, t);
     this.net.broadcast({ t: 'ability', id: p.info.id, ability }, false, p.info.id);
+  }
+
+  private startHeal(p: HostPlayer, t: Tier): void {
+    const time = stat('heal', 'time', t);
+    p.hot = { left: time, perSec: stat('heal', 'amount', t) / time };
+    const armor = stat('heal', 'armor', t);
+    if (armor > 0) p.info.armor = Math.min(PLAYER.maxArmor, p.info.armor + armor);
+    this.playersDirty = true;
   }
 
   addBarrier(msg: BarrierMsg): void {
@@ -754,10 +820,18 @@ export class MatchHost {
     this.net.broadcast(msg);
   }
 
-  damageBarrier(bid: string, dmg: number): void {
+  damageBarrier(bid: string, dmg: number, shooter: HostPlayer | null = null): void {
     const b = this.barriers.get(bid);
     if (!b || dmg <= 0) return;
-    b.hp -= Math.min(dmg, 400);
+    const dealt = Math.min(dmg, 400);
+    b.hp -= dealt;
+    // Awakened barrier: enemy shooters take part of what they pour into it.
+    const owner = this.players.get(b.msg.owner);
+    const bt = owner ? this.abilityTier(owner, 'barrier') : null;
+    if (owner && shooter && bt !== null && shooter.info.team !== b.msg.team) {
+      const rf = stat('barrier', 'reflect', bt);
+      if (rf > 0) this.applyDamage(shooter, owner, Math.min(25, dealt * rf), 'shock', 'barrier', 0.5);
+    }
     if (b.hp <= 0) {
       this.barriers.delete(bid);
       this.net.broadcast({ t: 'barrierGone', bid });
@@ -769,8 +843,9 @@ export class MatchHost {
     const owner = this.players.get(m.owner);
     const pos = g.pos;
     if (m.kind === 'frag') {
-      const radius = stat('frag', 'radius', m.rarity);
-      const maxD = stat('frag', 'damage', m.rarity);
+      const radius = stat('frag', m.sub ? 'subRadius' : 'radius', m.tier);
+      const maxD = stat('frag', m.sub ? 'subDamage' : 'damage', m.tier);
+      const slow = stat('frag', 'slow', m.tier);
       const origin = pos.clone().setY(pos.y + 0.15);
       this.batch(() => {
         for (const p of this.players.values()) {
@@ -781,35 +856,37 @@ export class MatchHost {
           let dmg = maxD * Math.pow(1 - d / radius, 0.7);
           if (owner && p === owner) dmg *= 0.5;
           else if (owner && p.info.team === owner.info.team) continue;
-          if (dmg >= 1) this.applyDamage(p, owner ?? null, dmg, 'blast', 'frag', 0.3);
+          if (dmg < 1) continue;
+          this.applyDamage(p, owner ?? null, dmg, 'blast', 'frag', 0.3);
+          if (slow > 0 && p !== owner && p.info.alive) this.debuff(p, 'slow', slow);
         }
       });
-      if (owner && m.syn.includes('seeker')) {
+      if (owner && m.syn.includes('seeker') && !m.sub) {
         const targets = [...this.players.values()].filter((p) => p.info.alive && p.info.team !== owner.info.team && p.pos.distanceTo(pos) < 12).map((p) => p.info.id);
         if (targets.length) {
           this.net.broadcast({ t: 'reveal', team: owner.info.team, targets, duration: 3, origin: v3(pos), kind: 'mark' });
           this.feedBotsReveal(owner.info.team, targets);
         }
       }
-      this.alertBots(pos, 30, owner ?? null);
+      this.alertBots(pos, m.sub ? 15 : 30, owner ?? null);
     } else if (m.kind === 'smoke') {
       this.smokes.push({
         pos: pos.clone(),
-        radius: stat('smoke', 'radius', m.rarity),
+        radius: stat('smoke', 'radius', m.tier),
         born: now() / 1000,
-        duration: stat('smoke', 'duration', m.rarity),
+        duration: stat('smoke', 'duration', m.tier),
         owner: m.owner,
         team: m.team,
-        toxic: m.syn.includes('toxic'),
+        dps: stat('smoke', 'dps', m.tier) + (m.syn.includes('toxic') ? TOXIC_SYN_DPS : 0),
         tick: 0,
       });
-      if (m.syn.includes('blindfog')) this.blindBots(pos, 2.2, m.owner);
+      if (m.syn.includes('blindfog')) this.blindBots(pos, 2.2, m.owner, m.team, 0);
     } else if (m.kind === 'flash') {
-      this.blindBots(pos, stat('flash', 'blind', m.rarity), m.owner);
+      this.blindBots(pos, stat('flash', 'blind', m.tier), m.owner, m.team, stat('flash', 'suppress', m.tier));
     }
   }
 
-  private blindBots(pos: THREE.Vector3, maxBlind: number, owner: string): void {
+  private blindBots(pos: THREE.Vector3, maxBlind: number, owner: string, team: TeamId, suppress: number): void {
     const thrower = this.players.get(owner);
     for (const p of this.players.values()) {
       if (!p.bot || !p.info.alive) continue;
@@ -824,6 +901,7 @@ export class MatchHost {
       const dur = maxBlind * f * (1 - Math.max(0, dist - 12) / 22);
       if (dur > 0.4) {
         p.flashedUntil = Math.max(p.flashedUntil, now() + dur * 1000);
+        if (suppress > 0 && p.info.team !== team) p.bot.suppress(suppress);
         if (thrower && thrower.info.team !== p.info.team && hasSynergy(thrower.info.abilities, 'markflash')) {
           this.net.broadcast({ t: 'reveal', team: thrower.info.team, targets: [p.info.id], duration: 3, kind: 'mark' });
         }
@@ -878,17 +956,17 @@ export class MatchHost {
   }
 
   botThrow(bot: HostPlayer, kind: ThrowMsg['kind'], pos: THREE.Vector3, vel: THREE.Vector3): void {
-    const r = this.abilityRarity(bot, kind);
-    if (r === null) return;
+    const t = this.abilityTier(bot, kind);
+    if (t === null) return;
     const syn: string[] = [];
     for (const s of ['blindfog', 'toxic', 'markflash', 'seeker']) if (hasSynergy(bot.info.abilities, s)) syn.push(s);
-    const msg: ThrowMsg = { t: 'throw', gid: `${bot.info.id}-${Math.random().toString(36).slice(2, 7)}`, kind, owner: bot.info.id, team: bot.info.team, pos: v3(pos), vel: v3(vel), rarity: r, syn };
+    const msg: ThrowMsg = { t: 'throw', gid: `${bot.info.id}-${Math.random().toString(36).slice(2, 7)}`, kind, owner: bot.info.id, team: bot.info.team, pos: v3(pos), vel: v3(vel), tier: t, syn };
     this.onThrow(msg, bot.info.id);
   }
 
   botBarrier(bot: HostPlayer, pos: THREE.Vector3, yaw: number): void {
-    const r = this.abilityRarity(bot, 'barrier');
-    if (r === null) return;
+    const t = this.abilityTier(bot, 'barrier');
+    if (t === null) return;
     this.addBarrier({
       t: 'barrier',
       bid: `${bot.info.id}-b${Math.random().toString(36).slice(2, 6)}`,
@@ -896,9 +974,9 @@ export class MatchHost {
       team: bot.info.team,
       pos: v3(pos),
       yaw,
-      width: stat('barrier', 'width', r),
-      hp: stat('barrier', 'hp', r),
-      duration: stat('barrier', 'duration', r),
+      width: stat('barrier', 'width', t),
+      hp: stat('barrier', 'hp', t),
+      duration: stat('barrier', 'duration', t),
       regen: hasSynergy(bot.info.abilities, 'regenwall'),
     });
   }
@@ -1010,7 +1088,7 @@ export class MatchHost {
         }
       }
     }
-    // Smokes: expiry + toxic ticks
+    // Smokes: expiry + poison ticks
     const ts = t / 1000;
     for (let i = this.smokes.length - 1; i >= 0; i--) {
       const s = this.smokes[i];
@@ -1018,7 +1096,7 @@ export class MatchHost {
         this.smokes.splice(i, 1);
         continue;
       }
-      if (!s.toxic || ts - s.born < 1) continue;
+      if (s.dps <= 0 || ts - s.born < 1) continue;
       s.tick += dt;
       if (s.tick >= 0.5) {
         s.tick -= 0.5;
@@ -1026,7 +1104,7 @@ export class MatchHost {
         this.batch(() => {
           for (const p of this.players.values()) {
             if (!p.info.alive || p.info.team === s.team) continue;
-            if (p.hitbox.center.distanceTo(s.pos) < s.radius * 0.9) this.applyDamage(p, owner, 6, 'toxic', 'smoke', 1);
+            if (p.hitbox.center.distanceTo(s.pos) < s.radius * 0.9) this.applyDamage(p, owner, s.dps * 0.5, 'toxic', 'smoke', 1);
           }
         });
       }
@@ -1045,6 +1123,7 @@ export class MatchHost {
     for (const p of this.players.values()) {
       p.flashedUntil += ms;
       p.spawnLockUntil += ms;
+      p.vulnUntil += ms;
       p.bot?.shiftTime(ms);
     }
     this.roundStartedAt += ms;

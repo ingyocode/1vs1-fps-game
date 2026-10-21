@@ -4,7 +4,7 @@ import { clamp, coneDirection, dampAngle, dirFromYawPitch, randRange, wrapAngle 
 import { F, WEAPON_INDEX, type ShotHit } from '../net/protocol';
 import { CharacterMotor, type MoveInput } from './movement';
 import { WEAPONS, damageAt, type WeaponId } from './weapons';
-import { ABILITIES, hasSynergy, stat, synergyPartners, type AbilityId, type DraftCard } from './abilities';
+import { ABILITIES, CLOAK_FLICKER, ECHO_DELAY, MAX_TIER, SLOW_MULT, hasSynergy, stat, synergyPartners, tierOf, type AbilityId, type DraftCard, type Tier } from './abilities';
 import type { HostPlayer, MatchHost } from './host';
 import { GRENADE_GRAVITY, THROW_SPEED } from './projectiles';
 
@@ -36,10 +36,16 @@ export class BotBrain {
   private burstPause = 0;
   private lastShot = -10;
   private charges = new Map<AbilityId, number>();
+  private recharge = new Map<AbilityId, number>();
   private abilityCd = 0;
   private cloakUntil = 0;
+  private flickerUntil = 0;
   private adrenalineUntil = 0;
   private infiniteUntil = 0;
+  private suppressUntil = 0;
+  private slowUntil = 0;
+  private dashAimUntil = 0;
+  private echo: { at: number; origin: THREE.Vector3 } | null = null;
   private path: number[] = [];
   private goal: THREE.Vector3 | null = null;
   private repathT = 0;
@@ -61,7 +67,7 @@ export class BotBrain {
   private draftOffer: DraftCard[] | null = null;
   private buyAt = 0;
   private liveAt = 0;
-  private reconUsed = false;
+  private reconAt = 0;
   private yaw = 0;
   private pitch = 0;
   private wantJump = false;
@@ -104,10 +110,10 @@ export class BotBrain {
     this.heard = null;
     this.path = [];
     this.goal = null;
-    this.cloakUntil = this.adrenalineUntil = this.infiniteUntil = 0;
-    this.reconUsed = false;
-    this.charges.clear();
-    for (const a of this.p.info.abilities) this.charges.set(a.id, stat(a.id, 'charges', a.rarity));
+    this.cloakUntil = this.flickerUntil = this.adrenalineUntil = this.infiniteUntil = 0;
+    this.suppressUntil = this.slowUntil = this.dashAimUntil = 0;
+    this.echo = null;
+    this.refillCharges();
     this.buyAt = now() + randRange(1500, 4500);
   }
 
@@ -118,17 +124,24 @@ export class BotBrain {
     this.weapon = this.p.info.primary ?? this.p.info.secondary;
     this.refillAll();
     this.charges.clear();
+    this.recharge.clear();
     for (const a of this.p.info.abilities) this.charges.set(a.id, 0);
-    this.reconUsed = true;
     this.liveAt = now();
+    this.reconAt = this.liveAt + randRange(10000, 18000);
     this.buyAt = this.host.phase === 'buy' ? now() + 1500 : 0;
   }
 
   /** Offline pause: push every absolute timestamp forward. */
   shiftTime(ms: number): void {
     this.cloakUntil += ms;
+    this.flickerUntil += ms;
     this.adrenalineUntil += ms;
     this.infiniteUntil += ms;
+    this.suppressUntil += ms;
+    this.slowUntil += ms;
+    this.dashAimUntil += ms;
+    this.reconAt += ms;
+    if (this.echo) this.echo.at += ms;
     this.throwFlagUntil += ms;
     this.lastShot += ms;
     if (this.draftAt) this.draftAt += ms;
@@ -141,6 +154,7 @@ export class BotBrain {
 
   onLive(): void {
     this.liveAt = now();
+    this.reconAt = this.liveAt + randRange(10000, 18000);
     this.weapon = this.p.info.primary ?? this.p.info.secondary;
     this.refillAll();
   }
@@ -162,7 +176,8 @@ export class BotBrain {
       const side = Math.random() < 0.5 ? 1 : -1;
       const dx = Math.cos(this.yaw) * side;
       const dz = -Math.sin(this.yaw) * side;
-      this.motor.startDash(dx, dz, stat('dash', 'distance', this.rarity('dash')));
+      this.motor.startDash(dx, dz, stat('dash', 'distance', this.tier('dash')));
+      if (stat('dash', 'aim', this.tier('dash')) > 0) this.dashAimUntil = now() + 1200;
       this.use('dash');
       if (hasSynergy(this.p.info.abilities, 'shadowstep')) this.cloakUntil = now() + 1500;
     }
@@ -177,15 +192,69 @@ export class BotBrain {
     this.heard = { pos: pos.clone(), t: now() };
   }
 
+  slow(duration: number): void {
+    this.slowUntil = Math.max(this.slowUntil, now() + duration * 1000);
+  }
+
+  suppress(duration: number): void {
+    this.suppressUntil = Math.max(this.suppressUntil, now() + duration * 1000);
+  }
+
+  /** Kill rewards of awakened dash / adrenaline (the adrenaline heal is applied by the host). */
+  onKill(): void {
+    const dash = tierOf(this.p.info.abilities, 'dash');
+    if (dash !== null && stat('dash', 'aim', dash) > 0) this.charges.set('dash', Math.min(stat('dash', 'charges', dash), (this.charges.get('dash') ?? 0) + 1));
+    const adr = tierOf(this.p.info.abilities, 'adrenaline');
+    if (adr !== null && now() < this.adrenalineUntil && stat('adrenaline', 'killHeal', adr) > 0) this.adrenalineUntil = now() + stat('adrenaline', 'duration', adr) * 1000;
+  }
+
   // ---------------------------------------------------------------------------
   // Ability helpers
   // ---------------------------------------------------------------------------
-  private rarity(id: AbilityId): 0 | 1 | 2 | 3 {
-    return this.p.info.abilities.find((a) => a.id === id)?.rarity ?? 0;
+  private tier(id: AbilityId): Tier {
+    return tierOf(this.p.info.abilities, id) ?? 0;
   }
 
   private has(id: AbilityId): boolean {
-    return (this.charges.get(id) ?? 0) > 0 && this.abilityCd <= 0;
+    return (this.charges.get(id) ?? 0) > 0 && this.abilityCd <= 0 && now() >= this.suppressUntil;
+  }
+
+  private refillCharges(): void {
+    this.charges.clear();
+    this.recharge.clear();
+    for (const a of this.p.info.abilities) this.charges.set(a.id, stat(a.id, 'charges', a.tier));
+  }
+
+  /** Charges come back over time for abilities with a recharge. */
+  private tickRecharge(dt: number): void {
+    for (const a of this.p.info.abilities) {
+      const rc = stat(a.id, 'recharge', a.tier);
+      const c = this.charges.get(a.id) ?? 0;
+      if (rc <= 0 || c >= stat(a.id, 'charges', a.tier)) continue;
+      const acc = (this.recharge.get(a.id) ?? 0) + dt;
+      if (acc >= rc) {
+        this.charges.set(a.id, c + 1);
+        this.recharge.set(a.id, 0);
+      } else this.recharge.set(a.id, acc);
+    }
+  }
+
+  private instantReload(): void {
+    const a = this.ammo.get(this.weapon);
+    const d = WEAPONS[this.weapon];
+    if (!a || d.slot === 'melee') return;
+    const take = Math.min(d.mag - a.mag, a.reserve);
+    a.mag += take;
+    a.reserve -= take;
+    this.reloadT = 0;
+  }
+
+  private pulse(origin: THREE.Vector3): void {
+    const tr = this.tier('recon');
+    const r = stat('recon', 'radius', tr);
+    const targets = [...this.host.players.values()].filter((e) => e.info.alive && e.info.team !== this.p.info.team && e.pos.distanceTo(origin) < r);
+    this.host.pulseReveal(this.p, targets.map((e) => e.info.id), stat('recon', 'reveal', tr), [origin.x, origin.y, origin.z], 'pulse');
+    if (targets.length) this.heard = { pos: targets[0].pos.clone(), t: now() };
   }
 
   private use(id: AbilityId): void {
@@ -229,6 +298,13 @@ export class BotBrain {
       this.shop();
     }
     this.abilityCd = Math.max(0, this.abilityCd - dt);
+    if (phase === 'live') {
+      this.tickRecharge(dt);
+      if (this.echo && t >= this.echo.at) {
+        this.pulse(this.echo.origin);
+        this.echo = null;
+      }
+    }
     this.fireCd = Math.max(0, this.fireCd - dt);
     this.burstPause = Math.max(0, this.burstPause - dt);
     this.bloom = Math.max(0, this.bloom - dt * WEAPONS[this.weapon].spread.recover * 0.5);
@@ -263,7 +339,7 @@ export class BotBrain {
       }
     }
 
-    const speedMult = WEAPONS[this.weapon].moveSpeed * (t < this.adrenalineUntil ? stat('adrenaline', 'speed', this.rarity('adrenaline')) : 1);
+    const speedMult = WEAPONS[this.weapon].moveSpeed * (t < this.adrenalineUntil ? stat('adrenaline', 'speed', this.tier('adrenaline')) : 1) * (t < this.slowUntil ? SLOW_MULT : 1);
     const frozen = phase === 'roundEnd' || phase === 'matchEnd' || phase === 'draft';
     const ev = this.motor.step(input, dt, this.host.world, speedMult, frozen);
     if (ev.jumped) this.wantJump = false;
@@ -290,7 +366,7 @@ export class BotBrain {
     let f = F.alive;
     if (this.motor.crouch > 0.5) f |= F.crouch;
     if (this.motor.body.onGround) f |= F.ground;
-    if (t < this.cloakUntil) f |= F.cloak;
+    if (t < this.cloakUntil && t >= this.flickerUntil) f |= F.cloak;
     if (t < this.adrenalineUntil) f |= F.adrenaline;
     if (t < this.infiniteUntil) f |= F.infinite;
     if (this.reloadT > 0) f |= F.reload;
@@ -305,9 +381,9 @@ export class BotBrain {
     let best = 0;
     let score = -1;
     offer.forEach((c, i) => {
-      let s = c.rarity * 10 + Math.random() * 4;
-      if (this.p.info.abilities.some((a) => a.id === c.ability)) s += 8;
-      if (synergyPartners(c.ability).some((sp) => this.p.info.abilities.some((a) => a.id === sp.partner))) s += 6;
+      // Bots lean toward committing to a path, but still branch out into synergies.
+      let s = Math.random() * 10 + (c.tier > 0 ? 2 + c.tier : 0);
+      if (c.tier === 0 && synergyPartners(c.ability).some((sp) => this.p.info.abilities.some((a) => a.id === sp.partner))) s += 3;
       if (s > score) {
         score = s;
         best = i;
@@ -330,14 +406,14 @@ export class BotBrain {
     if (p.info.armor < 50 && p.info.gold >= 1000) buy('armorHeavy');
     else if (p.info.armor < 25 && p.info.gold >= 400) buy('armorLight');
     if (p.info.gold > 2600) {
-      const up = p.info.abilities.find((a) => a.rarity < 3);
+      const up = p.info.abilities.find((a) => a.tier < MAX_TIER);
       if (up) buy(`up:${up.id}`);
     }
     const want = p.info.primary ?? p.info.secondary;
     this.weapon = want;
     this.ammo.clear();
     this.refillAll();
-    for (const a of p.info.abilities) this.charges.set(a.id, stat(a.id, 'charges', a.rarity));
+    this.refillCharges();
   }
 
   // ---------------------------------------------------------------------------
@@ -451,13 +527,14 @@ export class BotBrain {
       return;
     }
     if (this.has('adrenaline') && Math.random() < 0.55) {
-      this.adrenalineUntil = t + stat('adrenaline', 'duration', this.rarity('adrenaline')) * 1000;
+      this.adrenalineUntil = t + stat('adrenaline', 'duration', this.tier('adrenaline')) * 1000;
+      if (stat('adrenaline', 'reload', this.tier('adrenaline')) > 0) this.instantReload();
       this.use('adrenaline');
-      if (hasSynergy(this.p.info.abilities, 'berserk')) this.infiniteUntil = t + stat('infinite', 'duration', this.rarity('infinite')) * 600;
+      if (hasSynergy(this.p.info.abilities, 'berserk')) this.infiniteUntil = t + stat('infinite', 'duration', this.tier('infinite')) * 600;
     } else if (this.has('infinite') && Math.random() < 0.5) {
-      this.infiniteUntil = t + stat('infinite', 'duration', this.rarity('infinite')) * 1000;
+      this.infiniteUntil = t + stat('infinite', 'duration', this.tier('infinite')) * 1000;
       this.use('infinite');
-      if (hasSynergy(this.p.info.abilities, 'berserk')) this.adrenalineUntil = t + stat('adrenaline', 'duration', this.rarity('adrenaline')) * 600;
+      if (hasSynergy(this.p.info.abilities, 'berserk')) this.adrenalineUntil = t + stat('adrenaline', 'duration', this.tier('adrenaline')) * 600;
     }
     if (this.has('barrier') && this.p.info.hp < 60 && d > 9 && Math.random() < 0.5) {
       const dir = e.pos.clone().sub(this.motor.body.pos).setY(0).normalize();
@@ -466,7 +543,10 @@ export class BotBrain {
       this.host.botBarrier(this.p, pos, yaw);
       this.use('barrier');
     }
-    if (this.has('smoke') && this.p.info.hp < 40) {
+    if (this.has('smoke') && stat('smoke', 'dps', this.tier('smoke')) > 0 && d > 6 && d < 24 && Math.random() < 0.3) {
+      // Poison smoke is offensive: drop it on the enemy to flush them out.
+      this.throwAt('smoke', e.pos.clone());
+    } else if (this.has('smoke') && this.p.info.hp < 40) {
       this.throwAt('smoke', this.motor.body.pos.clone().lerp(e.pos, 0.3));
       this.retreatT = 3;
     }
@@ -477,20 +557,19 @@ export class BotBrain {
       const d = this.eye.distanceTo(this.lastSeen.pos);
       if (d > 7 && d < 26 && Math.random() < 0.02) this.throwAt('frag', this.lastSeen.pos);
     }
-    if (!this.reconUsed && this.has('recon') && t - this.liveAt > randRange(12000, 20000)) {
-      this.reconUsed = true;
-      const r = stat('recon', 'radius', this.rarity('recon'));
-      const targets = [...this.host.players.values()].filter((e) => e.info.alive && e.info.team !== this.p.info.team && e.pos.distanceTo(this.motor.body.pos) < r);
+    if (t >= this.reconAt && this.has('recon')) {
+      this.reconAt = t + randRange(12000, 20000);
       this.use('recon');
-      this.host.net.broadcast({ t: 'reveal', team: this.p.info.team, targets: targets.map((e) => e.info.id), duration: stat('recon', 'reveal', this.rarity('recon')), origin: [this.eye.x, this.eye.y, this.eye.z], kind: 'pulse' });
-      if (targets.length) this.heard = { pos: targets[0].pos.clone(), t };
+      this.pulse(this.eye.clone());
+      if (stat('recon', 'echo', this.tier('recon')) > 0) this.echo = { at: t + ECHO_DELAY * 1000, origin: this.eye.clone() };
     }
     if (this.p.info.hp < 60 && this.has('heal') && Math.random() < 0.02) {
       this.host.onAbility(this.p, 'heal');
       this.use('heal');
     }
     if (this.has('cloak') && Math.random() < 0.002) {
-      this.cloakUntil = t + stat('cloak', 'duration', this.rarity('cloak')) * 1000;
+      this.cloakUntil = t + stat('cloak', 'duration', this.tier('cloak')) * 1000;
+      this.flickerUntil = 0;
       this.use('cloak');
     }
   }
@@ -617,7 +696,7 @@ export class BotBrain {
       }
     } else if (dist > (def.meleeRange ?? 2.3)) return;
 
-    const fireMult = (t < this.adrenalineUntil ? stat('adrenaline', 'fire', this.rarity('adrenaline')) : 1) * (infinite ? stat('infinite', 'fireRate', this.rarity('infinite')) : 1);
+    const fireMult = (t < this.adrenalineUntil ? stat('adrenaline', 'fire', this.tier('adrenaline')) : 1) * (infinite ? stat('infinite', 'fireRate', this.tier('infinite')) : 1);
     this.fireCd = 60 / def.rpm / fireMult + (def.auto ? 0 : randRange(0.06, 0.2));
     if (def.auto) {
       if (this.burstLeft <= 0) this.burstLeft = Math.round(randRange(this.skill.burst[0], this.skill.burst[1]));
@@ -626,13 +705,18 @@ export class BotBrain {
     }
     if (a && !infinite && def.slot !== 'melee') a.mag--;
     this.lastShot = t;
-    if (!(t < this.infiniteUntil && hasSynergy(this.p.info.abilities, 'phantom'))) this.cloakUntil = 0;
+    if (t < this.cloakUntil) {
+      // An awakened cloak (or phantom during infinite) only flickers when firing.
+      if (stat('cloak', 'phantom', this.tier('cloak')) > 0 || (infinite && hasSynergy(this.p.info.abilities, 'phantom'))) this.flickerUntil = t + CLOAK_FLICKER * 1000;
+      else this.cloakUntil = 0;
+    }
 
     const view = dirFromYawPitch(this.yaw, this.pitch);
     const speed = this.motor.speed2D;
     const moveK = clamp((speed - 1.2) / 5, 0, 1);
     const sniperAds = def.id === 'sniper' && speed < 1;
-    let spread = (sniperAds ? def.spread.ads : def.spread.hip) + def.spread.move * moveK + (this.motor.body.onGround ? 0 : def.spread.air) + this.bloom * this.skill.sprayBloom;
+    const precise = t < this.dashAimUntil;
+    let spread = (sniperAds ? def.spread.ads : def.spread.hip) + (precise ? 0 : def.spread.move * moveK) + (this.motor.body.onGround || precise ? 0 : def.spread.air) + this.bloom * this.skill.sprayBloom;
     if (this.motor.crouch > 0.5) spread *= def.spread.crouch;
     this.bloom = Math.min(def.spread.bloomMax + 0.02, this.bloom + def.spread.bloom + (def.auto ? 0.004 : 0));
 
@@ -654,7 +738,7 @@ export class BotBrain {
           cur.dmg += dmg;
           if (res.zone === 'head') cur.zone = 'head';
         } else perTarget.set(res.player, { dmg, zone: res.zone, dist: res.dist });
-      } else if (res.barrier) this.host.damageBarrier(res.barrier, def.damage);
+      } else if (res.barrier) this.host.damageBarrier(res.barrier, def.damage, this.p);
     }
     this.host.botFire(this.p, this.weapon, this.eye.clone().add(new THREE.Vector3(0, -0.12, 0)), hits);
     for (const [target, r] of perTarget) this.host.applyDamage(target, this.p, r.dmg, r.zone, this.weapon, def.armorPen);
