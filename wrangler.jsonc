@@ -1,0 +1,14 @@
+// Cloudflare Workers static-assets deploy (`npx wrangler deploy`).
+// Having this file skips Wrangler's auto-setup, which would otherwise try to
+// inject @cloudflare/vite-plugin into vite.config.ts and fail. No Worker code:
+// `dist/` is served as plain static files, so there is no server cost.
+{
+  "name": "1vs1-fps-game",
+  "compatibility_date": "2026-10-19",
+  "build": {
+    "command": "npm run build"
+  },
+  "assets": {
+    "directory": "./dist"
+  }
+}

@@ -28,6 +28,7 @@ npm run preview    # 빌드 결과 미리보기
 `dist/`는 순수 정적 파일입니다(`base: './'` 상대 경로). 아래 중 아무 곳에나 올리면 됩니다.
 
 - **GitHub Pages**: 저장소에 푸시 → Settings → Pages → Source를 *GitHub Actions*로 설정. `.github/workflows/deploy.yml`이 lint → build → 배포까지 자동 수행합니다.
+- **Cloudflare Workers**: 저장소를 연결하고 배포 명령은 기본값 `npx wrangler deploy` 그대로 둡니다. 루트의 `wrangler.jsonc`가 `npm run build` 실행 후 `dist/`를 정적 에셋으로 올리므로 빌드 명령 칸은 비워 둬도 됩니다.
 - Cloudflare Pages / Netlify / Vercel / itch.io: 빌드 명령 `npm run build`, 출력 폴더 `dist`.
 
 ## 멀티플레이 방법
