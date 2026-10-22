@@ -92,7 +92,7 @@ export class CharacterMotor {
         // Standing up needs head room (in air we can also extend the legs down).
         const testPos = b.pos.clone();
         if (!b.onGround) testPos.y -= nextH - prevH;
-        if (world.canStand(testPos, b.radius, nextH)) {
+        if (world.canStand(testPos, b.radius, nextH, b)) {
           if (!b.onGround) b.pos.y = testPos.y;
           this.crouch = next;
           b.height = nextH;

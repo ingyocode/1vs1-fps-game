@@ -2,7 +2,7 @@ import type { TeamId, HitZone } from '../core/config';
 import type { WeaponId } from '../game/weapons';
 import type { AbilityId, DraftCard, OwnedAbility, ThrowKind, Tier } from '../game/abilities';
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 export type V3 = [number, number, number];
 export type Phase = 'lobby' | 'draft' | 'buy' | 'live' | 'roundEnd' | 'matchEnd';
@@ -116,9 +116,12 @@ export type HostMsg =
   | { t: 'phase'; phase: Phase; round: number; endsAt: number; scores: [number, number] }
   | { t: 'players'; list: PlayerInfo[] }
   | { t: 'snap'; ht: number; s: SnapEntry[] }
-  | { t: 'draftOffer'; pick: number; total: number; cards: DraftCard[]; endsAt: number }
-  | { t: 'draftWait' }
+  /** `bonus`: an extra card earned by losing rounds, drafted during the buy phase. */
+  | { t: 'draftOffer'; pick: number; total: number; cards: DraftCard[]; endsAt: number; bonus?: boolean }
+  | { t: 'draftWait'; bonus?: boolean }
   | { t: 'roundStart'; round: number; spawns: { id: string; pos: V3; yaw: number }[] }
+  /** Shooting range: one player (or target) comes back mid-round. */
+  | { t: 'respawn'; id: string; pos: V3; yaw: number }
   | { t: 'coins'; list: CoinInfo[] }
   | { t: 'coinTaken'; id: number; by: string; value: number }
   | { t: 'fire'; id: string; w: WeaponId; o: V3; hits: ShotHit[] }

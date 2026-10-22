@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { ECON, PLAYER, TIMING, type HitZone, type TeamId } from '../core/config';
+import { ECON, PLAYER, TEAMS, TIMING, type HitZone, type TeamId } from '../core/config';
 import { shuffle } from '../core/utils';
 import type { Net } from '../net/network';
 import {
@@ -22,7 +22,7 @@ import {
 import type { GameMap } from '../world/map';
 import { segmentHitsSphere } from '../world/collision';
 import { ARMOR_ITEMS, WEAPONS, applyArmor, type WeaponId } from './weapons';
-import { ABILITIES, MAX_TIER, TIERS, TOXIC_SYN_DPS, UPGRADE_COST, VULN_BONUS, applyPick, hasSynergy, rollOffer, stat, tierOf, type AbilityId, type DraftCard, type Tier } from './abilities';
+import { BARRIER_HALF_DEPTH, BARRIER_HEIGHT, BONUS_PICK_LOSSES, MAX_TIER, TOXIC_SYN_DPS, VULN_BONUS, applyPick, hasSynergy, rollOffer, stat, tierOf, type AbilityId, type DraftCard, type Tier } from './abilities';
 import { Hitbox } from './hitbox';
 import { ProjectileSystem, type Grenade } from './projectiles';
 import { NavGraph } from './nav';
@@ -51,6 +51,8 @@ export interface HostPlayer {
   vulnUntil: number;
   /** Awakened heal: the once-per-round lethal-hit save is still available. */
   lastStand: boolean;
+  /** Extra draft cards earned by losing rounds, offered during the next buy phase. */
+  bonusPicks: number;
 }
 
 interface HostSmoke {
@@ -96,6 +98,9 @@ export class MatchHost {
   private botSeq = 1;
   private roundStartedAt = 0;
   private pendingNext: { at: number; fn: () => void } | null = null;
+  /** Shooting range (offline): no rounds or economy, targets respawn, every gun is free. */
+  range = false;
+  private respawnAt = new Map<string, number>();
   private roundMvpDamage = new Map<string, number>();
   private batching = false;
 
@@ -181,6 +186,7 @@ export class MatchHost {
       lastSeq: 0,
       vulnUntil: 0,
       lastStand: false,
+      bonusPicks: 0,
     };
     if (bot) p.bot = new BotBrain(p, this);
     this.players.set(id, p);
@@ -346,7 +352,7 @@ export class MatchHost {
         p.w = msg.w;
         p.flags = (msg.f & ~F.alive) | (p.info.alive ? F.alive : 0);
         p.lastStateAt = now();
-        p.hitbox.update(p.pos, p.yaw, msg.f & F.crouch ? 1 : 0);
+        p.hitbox.update(p.pos, p.yaw, msg.f & F.crouch ? 1 : 0, p.pitch, WEAPON_INDEX[p.w]);
         break;
       }
       case 'fire':
@@ -438,6 +444,7 @@ export class MatchHost {
       Object.assign(p.info, { hp: PLAYER.maxHp, armor: 0, alive: false, gold: ECON.start, kills: 0, deaths: 0, assists: 0, damage: 0, primary: null, secondary: 'pistol', abilities: [] });
       p.draftOffer = null;
       p.draftPicked = false;
+      p.bonusPicks = 0;
     }
     this.playersDirty = true;
     this.draftPick = 0;
@@ -460,14 +467,56 @@ export class MatchHost {
   }
 
   onDraftPick(p: HostPlayer, index: number): void {
-    if (this.phase !== 'draft' || p.draftPicked || !p.draftOffer) return;
+    const bonus = this.phase === 'buy' && p.bonusPicks > 0;
+    if ((this.phase !== 'draft' && !bonus) || p.draftPicked || !p.draftOffer) return;
     const card = p.draftOffer[Math.max(0, Math.min(p.draftOffer.length - 1, index | 0))];
     p.info.abilities = applyPick(p.info.abilities, card);
     p.draftPicked = true;
     this.playersDirty = true;
+    if (bonus) {
+      p.bonusPicks--;
+      p.draftOffer = null;
+      p.bot?.onAbilitiesChanged();
+      this.flushPlayers();
+      if (!p.bot) this.net.sendTo(p.info.id, { t: 'draftWait', bonus: true });
+      if (p.bonusPicks > 0) this.offerBonus(p);
+      return;
+    }
     if (!p.bot) this.net.sendTo(p.info.id, { t: 'draftWait' });
     if ([...this.players.values()].every((q) => q.draftPicked) && !this.pendingNext) {
       this.pendingNext = { at: now() + 900, fn: () => this.nextDraftPick() };
+    }
+  }
+
+  /** Sends the next earned bonus card set (buy phase). Nothing left to draft = the pick lapses. */
+  private offerBonus(p: HostPlayer): void {
+    const cards = rollOffer(p.info.abilities);
+    if (!cards.length) {
+      p.bonusPicks = 0;
+      p.draftOffer = null;
+      return;
+    }
+    p.draftOffer = cards;
+    p.draftPicked = false;
+    if (p.bot) p.bot.scheduleDraft(cards);
+    else this.net.sendTo(p.info.id, { t: 'draftOffer', pick: 1, total: p.bonusPicks, cards, endsAt: this.phaseEndsAt, bonus: true });
+  }
+
+  /** Buy phase over: any bonus card still undecided is picked at random, like a draft timeout. */
+  private settleBonusPicks(): void {
+    for (const p of this.players.values()) {
+      if (p.bonusPicks <= 0) continue;
+      while (p.bonusPicks > 0) {
+        const offer = p.draftOffer && !p.draftPicked ? p.draftOffer : rollOffer(p.info.abilities);
+        p.draftOffer = null;
+        if (!offer.length) break;
+        p.info.abilities = applyPick(p.info.abilities, offer[Math.floor(Math.random() * offer.length)]);
+        p.bonusPicks--;
+      }
+      p.bonusPicks = 0;
+      p.draftPicked = true;
+      p.bot?.onAbilitiesChanged();
+      this.playersDirty = true;
     }
   }
 
@@ -501,6 +550,7 @@ export class MatchHost {
     this.net.broadcast({ t: 'coins', list: [] });
     for (const p of this.players.values()) p.bot?.onRoundStart();
     this.flushPlayers();
+    for (const p of this.players.values()) if (p.bonusPicks > 0) this.offerBonus(p);
   }
 
   private clearRoundState(): void {
@@ -513,6 +563,7 @@ export class MatchHost {
   }
 
   private goLive(): void {
+    this.settleBonusPicks();
     this.setPhase('live', TIMING.round);
     this.roundStartedAt = now();
     // Spawn mirrored pairs of small coins plus one centre coin.
@@ -544,8 +595,13 @@ export class MatchHost {
         if (p.info.team === winner) this.giveGold(p, ECON.win, '라운드 승리');
         else this.giveGold(p, ECON.loss + ECON.lossStep * Math.min(ECON.lossMaxSteps, this.lossStreak[loser] - 1), '라운드 패배 보상');
       }
+      // Every BONUS_PICK_LOSSES lost rounds (the winner's score counts the loser's losses), one more card.
+      if (this.scores[winner] % BONUS_PICK_LOSSES === 0 && this.scores[winner] < this.settings.firstTo) {
+        for (const p of this.players.values()) if (p.info.team === loser) p.bonusPicks++;
+        this.chatSystem(`${TEAMS[loser].name} 팀 ${this.scores[winner]}패 · 다음 구매 단계에서 증강을 하나 더 고릅니다.`);
+      }
     } else {
-      for (const p of this.players.values()) this.giveGold(p, ECON.loss, '무승부');
+      for (const p of this.players.values()) this.giveGold(p, ECON.draw, '무승부');
     }
     let mvp: string | null = null;
     let best = 0;
@@ -565,6 +621,64 @@ export class MatchHost {
         } else this.startRound(this.round + 1);
       },
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Shooting range
+  // ---------------------------------------------------------------------------
+  /** Offline aim practice on the warehouse lane: one live "round" that never ends. */
+  startRange(): void {
+    const r = this.map.range;
+    this.range = true;
+    this.settings = { mode: '1v1', firstTo: 99, botFill: false, botSkill: 1 };
+    this.scores = [0, 0];
+    this.round = 1;
+    this.clearRoundState();
+    const self = this.players.get(this.net.selfId)!;
+    Object.assign(self.info, { team: 0, hp: PLAYER.maxHp, armor: 0, alive: true, gold: 0, primary: 'rifle', secondary: 'pistol', abilities: [] });
+    const spawns: { id: string; pos: V3; yaw: number }[] = [];
+    const place = (p: HostPlayer, pos: THREE.Vector3, yaw: number): void => {
+      p.pos.copy(pos);
+      p.spawnPos.copy(pos);
+      p.spawnLockUntil = now() + 600;
+      p.yaw = yaw;
+      p.pitch = 0;
+      p.hitbox.update(p.pos, p.yaw, 0);
+      spawns.push({ id: p.info.id, pos: v3(pos), yaw });
+    };
+    place(self, r.spawn.pos, r.spawn.yaw);
+    r.targets.forEach((tg, i) => {
+      const p = this.addPlayer(`target-${i}`, tg.name, true, 1);
+      Object.assign(p.info, { hp: PLAYER.maxHp, alive: true, gold: 0, primary: 'rifle', secondary: 'pistol', abilities: [] });
+      p.bot!.dummy = { home: tg.pos.clone(), yaw: tg.yaw, strafe: tg.strafe, crouch: tg.crouch, dir: 1, flipT: 0, t: i * 0.7 };
+      place(p, tg.pos, tg.yaw);
+    });
+    this.setPhase('live', 24 * 3600);
+    this.roundStartedAt = now();
+    this.net.broadcast({ t: 'roundStart', round: 1, spawns });
+    for (const p of this.players.values()) p.bot?.onRoundStart();
+    this.flushPlayers();
+  }
+
+  private tickRange(t: number): void {
+    for (const [id, at] of this.respawnAt) {
+      if (t < at) continue;
+      this.respawnAt.delete(id);
+      const p = this.players.get(id);
+      if (!p) continue;
+      const home = p.bot?.dummy ? { pos: p.bot.dummy.home, yaw: p.bot.dummy.yaw } : this.map.range.spawn;
+      p.info.alive = true;
+      p.info.hp = PLAYER.maxHp;
+      p.dmgFrom.clear();
+      p.pos.copy(home.pos);
+      p.spawnPos.copy(home.pos);
+      p.spawnLockUntil = t + 600;
+      p.yaw = home.yaw;
+      p.hitbox.update(p.pos, p.yaw, 0);
+      p.bot?.onRoundStart();
+      this.playersDirty = true;
+      this.net.broadcast({ t: 'respawn', id, pos: v3(home.pos), yaw: home.yaw });
+    }
   }
 
   toLobby(): void {
@@ -587,7 +701,7 @@ export class MatchHost {
   // Economy
   // ---------------------------------------------------------------------------
   giveGold(p: HostPlayer, amount: number, reason: string): void {
-    if (amount <= 0) return;
+    if (amount <= 0 || this.range) return;
     p.info.gold = Math.min(ECON.max, p.info.gold + amount);
     this.playersDirty = true;
     if (!p.bot) this.net.sendTo(p.info.id, { t: 'gold', amount, reason });
@@ -597,7 +711,7 @@ export class MatchHost {
     const fail = (msg: string): void => {
       if (!p.bot) this.net.sendTo(p.info.id, { t: 'buyResult', ok: false, msg });
     };
-    if (this.phase !== 'buy') return fail('구매 단계에서만 구매할 수 있습니다.');
+    if (this.phase !== 'buy' && !this.range) return fail('구매 단계에서만 구매할 수 있습니다.');
     if (!p.info.alive) return fail('사망 상태에서는 구매할 수 없습니다.');
     let cost: number;
     let done: string;
@@ -605,7 +719,7 @@ export class MatchHost {
       const def = WEAPONS[item as WeaponId];
       if (def.slot === 'melee') return fail('구매할 수 없습니다.');
       if ((def.slot === 'primary' && p.info.primary === def.id) || (def.slot === 'secondary' && p.info.secondary === def.id)) return fail('이미 보유 중입니다.');
-      cost = def.price;
+      cost = this.range ? 0 : def.price;
       if (p.info.gold < cost) return fail('골드가 부족합니다.');
       if (def.slot === 'primary') p.info.primary = def.id;
       else p.info.secondary = def.id;
@@ -614,19 +728,12 @@ export class MatchHost {
       const a = ARMOR_ITEMS.find((x) => x.id === item);
       if (!a) return fail('알 수 없는 품목');
       if (p.info.armor >= a.amount) return fail('이미 그 이상의 방어력을 보유 중입니다.');
-      cost = a.price;
+      cost = this.range ? 0 : a.price;
       if (p.info.gold < cost) return fail('골드가 부족합니다.');
       p.info.armor = a.amount;
       done = `${a.name} 구매`;
     } else if (item.startsWith('up:')) {
-      const id = item.slice(3) as AbilityId;
-      const owned = p.info.abilities.find((a) => a.id === id);
-      if (!owned) return fail('보유하지 않은 능력입니다.');
-      if (owned.tier >= MAX_TIER) return fail('이미 각성 단계입니다.');
-      cost = UPGRADE_COST[owned.tier as 0 | 1];
-      if (p.info.gold < cost) return fail('골드가 부족합니다.');
-      owned.tier = (owned.tier + 1) as Tier;
-      done = `${ABILITIES[id].name} ${TIERS[owned.tier].roman} · ${ABILITIES[id].tiers[owned.tier].title}`;
+      return fail(`능력은 골드로 강화할 수 없습니다. 라운드 ${BONUS_PICK_LOSSES}패마다 추가 증강을 고릅니다.`);
     } else return fail('알 수 없는 품목');
     p.info.gold -= cost;
     this.playersDirty = true;
@@ -707,14 +814,16 @@ export class MatchHost {
     victim.info.alive = false;
     victim.info.hp = 0;
     victim.info.deaths++;
-    victim.info.primary = null;
-    victim.info.secondary = 'pistol';
-    victim.info.armor = 0;
+    if (!this.range) {
+      victim.info.primary = null;
+      victim.info.secondary = 'pistol';
+      victim.info.armor = 0;
+    } else this.respawnAt.set(victim.info.id, now() + (victim.bot ? 1400 : 2200));
     victim.hot = null;
     let assister: string | null = null;
     if (killer && killer !== victim && killer.info.team !== victim.info.team) {
       killer.info.kills++;
-      const reward = (w in WEAPONS ? WEAPONS[w as WeaponId].killReward : 300) + (head ? ECON.headshotBonus : 0);
+      const reward = (w in WEAPONS ? WEAPONS[w as WeaponId].killReward : ECON.kill) + (head ? ECON.headshotBonus : 0);
       this.giveGold(killer, reward, head ? '헤드샷 처치' : '처치');
       let bestAssist = 0;
       for (const [id, d] of victim.dmgFrom) {
@@ -743,7 +852,7 @@ export class MatchHost {
 
   /** Ends the round if a team has nobody left (both wiped out at once = draw). */
   private checkElimination(): void {
-    if (this.phase !== 'live') return;
+    if (this.phase !== 'live' || this.range) return;
     const alive: [boolean, boolean] = [false, false];
     for (const p of this.players.values()) if (p.info.alive) alive[p.info.team] = true;
     if (!alive[0] && !alive[1]) this.endRound(-1, 'elimination');
@@ -964,6 +1073,18 @@ export class MatchHost {
     this.onThrow(msg, bot.info.id);
   }
 
+  /** True when a barrier at `pos` would not enclose any living player (bots check before deploying). */
+  barrierFits(pos: THREE.Vector3, yaw: number, width: number): boolean {
+    const hx = yaw === 0 ? width / 2 : BARRIER_HALF_DEPTH;
+    const hz = yaw === 0 ? BARRIER_HALF_DEPTH : width / 2;
+    for (const p of this.players.values()) {
+      if (!p.info.alive) continue;
+      const r = PLAYER.radius + 0.05;
+      if (Math.abs(p.pos.x - pos.x) < hx + r && Math.abs(p.pos.z - pos.z) < hz + r && p.pos.y < pos.y + BARRIER_HEIGHT && p.pos.y + PLAYER.heightStand > pos.y) return false;
+    }
+    return true;
+  }
+
   botBarrier(bot: HostPlayer, pos: THREE.Vector3, yaw: number): void {
     const t = this.abilityTier(bot, 'barrier');
     if (t === null) return;
@@ -1019,6 +1140,11 @@ export class MatchHost {
         if (t >= this.phaseEndsAt) this.goLive();
         break;
       case 'live': {
+        if (this.range) {
+          this.tickRange(t);
+          this.tickAbilities(dt, t);
+          break;
+        }
         if (t >= this.phaseEndsAt) {
           const hp: [number, number] = [0, 0];
           for (const p of this.players.values()) if (p.info.alive) hp[p.info.team] += p.info.hp;
@@ -1042,7 +1168,7 @@ export class MatchHost {
 
     for (const p of this.players.values()) {
       if (p.bot) p.bot.update(dt);
-      else p.hitbox.update(p.pos, p.yaw, p.flags & F.crouch ? 1 : 0);
+      else p.hitbox.update(p.pos, p.yaw, p.flags & F.crouch ? 1 : 0, p.pitch, WEAPON_INDEX[p.w]);
     }
     this.projectiles.update(dt, (g) => this.onDetonate(g));
 
@@ -1127,6 +1253,7 @@ export class MatchHost {
       p.bot?.shiftTime(ms);
     }
     this.roundStartedAt += ms;
+    for (const [id, at] of this.respawnAt) this.respawnAt.set(id, at + ms);
     if (this.pendingNext) this.pendingNext.at += ms;
     for (const b of this.barriers.values()) b.expires += ms;
     for (const sm of this.smokes) sm.born += ms / 1000;

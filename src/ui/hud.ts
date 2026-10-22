@@ -30,6 +30,8 @@ export interface HudState {
   abilities: HudAbility[];
   synergies: SynergyDef[];
   timer: number;
+  /** Replaces the countdown (shooting range shows ∞). */
+  clock?: string;
   phaseLabel: string;
   scores: [number, number];
   round: number;
@@ -171,6 +173,9 @@ export class Hud {
     E.inv = h('div', { class: 'inventory' });
     this.root.append(h('div', { class: 'weapon-panel' }, E.inv, h('div', { class: 'weapon-main' }, E.weaponIcon, h('div', { class: 'ammo' }, E.mag, h('span', { class: 'slash' }, '/'), E.reserve)), E.weaponName, E.reload));
 
+    // Shooting range readout + floating damage numbers
+    E.range = h('div', { class: 'range-panel hidden' });
+    this.root.append(E.range);
     E.stats = h('div', { class: 'net-stats' });
     this.root.append(E.stats);
     E.effects = h('div', { class: 'status-effects' });
@@ -300,7 +305,7 @@ export class Hud {
     toggleClass(this.root, 'dead', !s.alive);
     setText(E.score0, String(s.scores[0]));
     setText(E.score1, String(s.scores[1]));
-    setText(E.timer, formatClock(s.timer));
+    setText(E.timer, s.clock ?? formatClock(s.timer));
     toggleClass(E.timer, 'urgent', s.timer <= 10 && s.phaseLabel === '전투');
     setText(E.phase, s.phaseLabel);
     setText(E.round, `ROUND ${s.round} · ${s.firstTo}선승`);
@@ -425,6 +430,23 @@ export class Hud {
     });
   }
 
+  setRangeMode(on: boolean): void {
+    toggleClass(this.root, 'range', on);
+    toggleClass(this.els.range, 'hidden', !on);
+  }
+
+  setRangeStats(rows: [string, string][]): void {
+    const html = `<div class="rp-title">사격장 기록</div>${rows.map(([k, v]) => `<div class="rp-row"><span>${escapeHtml(k)}</span><b>${escapeHtml(v)}</b></div>`).join('')}`;
+    if (this.els.range.innerHTML !== html) this.els.range.innerHTML = html;
+  }
+
+  /** Damage dealt, floating up from the screen point that was hit. */
+  damageNumber(x: number, y: number, amount: number, zone: string): void {
+    const el = h('div', { class: `dmg-num z-${zone}`, style: `left:${Math.round(x)}px; top:${Math.round(y)}px; --dx:${Math.round((Math.random() - 0.5) * 40)}px` }, String(amount));
+    this.root.append(el);
+    window.setTimeout(() => el.remove(), 950);
+  }
+
   setCenter(html: string | null): void {
     const E = this.els;
     if (html === null) {
@@ -435,9 +457,10 @@ export class Hud {
     if (E.center.innerHTML !== html) E.center.innerHTML = html;
   }
 
-  hitmarker(head: boolean, kill: boolean): void {
+  /** `limb` = arm/leg hit (reduced damage), drawn dimmer. */
+  hitmarker(head: boolean, kill: boolean, limb = false): void {
     const E = this.els;
-    E.hit.className = `hitmarker show ${head ? 'head' : ''} ${kill ? 'kill' : ''}`;
+    E.hit.className = `hitmarker show ${head ? 'head' : ''} ${kill ? 'kill' : ''} ${limb && !kill ? 'limb' : ''}`;
     void E.hit.offsetWidth;
     this.hitTimer = kill ? 0.45 : 0.2;
   }

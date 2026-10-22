@@ -10,6 +10,8 @@ export interface MenuActions {
   host(): void;
   join(code: string): void;
   practice(s: MatchSettings): void;
+  /** Offline shooting range: aim training with every weapon. */
+  range(): void;
 }
 
 export class MainMenu {
@@ -57,6 +59,10 @@ export class MainMenu {
           btn('방 만들기', '친구를 초대해 1v1 / 2v2', ICONS.users, () => this.actions.host(), true),
           btn('방 참가', '초대 코드로 입장', ICONS.login, () => this.openJoin()),
           btn('봇과 연습', '오프라인 · 즉시 시작', ICONS.bot, () => this.openPractice()),
+          btn('사격장', '에임 연습 · 모든 총기 무료', ICONS.target, () => {
+            this.commitName();
+            this.actions.range();
+          }),
           btn('설정', '감도 · 화질 · 사운드', ICONS.gear, () => this.openSettings()),
           btn('조작법', '키 배치 안내', ICONS.keyboard, () => this.openControls()),
         ),
@@ -284,7 +290,7 @@ export function controlsPanel(): HTMLElement {
     h(
       'div',
       { class: 'ctl-note' },
-      '라운드는 상대 팀 전원을 처치하면 즉시 종료됩니다. 맵의 골드 코인, 처치·어시스트·라운드 결과로 골드를 모아 구매 단계에 무기·방어구·능력 강화를 구매하세요. 헤드샷은 큰 추가 피해를 줍니다.',
+      '라운드는 상대 팀 전원을 처치하면 즉시 종료됩니다. 맵의 골드 코인, 처치·어시스트·라운드 결과로 골드를 모아 구매 단계에 무기·방어구를 구매하세요. 능력은 골드로 강화할 수 없고, 라운드를 2번 질 때마다 증강을 한 장 더 고릅니다. 헤드샷은 큰 추가 피해를, 팔·다리는 줄어든 피해를 줍니다.',
     ),
   );
 }

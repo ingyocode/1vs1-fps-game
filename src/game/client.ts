@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { NET, TEAMS, type TeamId } from '../core/config';
+import { NET, TEAMS, type HitZone, type TeamId } from '../core/config';
 import type { Input } from '../core/input';
 import { settings } from '../core/settings';
 import { clamp, damp, dirFromYawPitch, lerp, wrapAngle, escapeHtml } from '../core/utils';
@@ -35,8 +35,8 @@ import { LocalPlayer, type PlayerHooks, type ShotResult, type TraceResult } from
 import { ViewModel } from './viewmodel';
 import { ProjectileSystem, type Grenade } from './projectiles';
 import { CoinField } from './coins';
-import { WEAPONS, type WeaponDef, type WeaponId } from './weapons';
-import { ABILITIES, VULN_BONUS, activeSynergies, applyPick, hasSynergy, stat, tierOf, type AbilityId, type DraftCard, type ThrowKind, type Tier } from './abilities';
+import { WEAPONS, ZONE_NAME, ZONE_PRIORITY, type WeaponDef, type WeaponId } from './weapons';
+import { ABILITIES, BARRIER_HALF_DEPTH, BARRIER_HEIGHT, VULN_BONUS, activeSynergies, applyPick, hasSynergy, stat, tierOf, type AbilityId, type DraftCard, type ThrowKind, type Tier } from './abilities';
 import type { MatchHost } from './host';
 import { SUN_DIR } from '../render/environment';
 import { cinematicCamera } from '../render/cinematic';
@@ -128,7 +128,7 @@ class RemotePlayer {
     if (this.vel.length() > 40) this.vel.set(0, 0, 0);
     this.prevPos.copy(this.pos);
     this.crouch = damp(this.crouch, this.flags & F.crouch ? 1 : 0, 12, dt);
-    this.hitbox.update(this.pos, this.yaw, this.crouch);
+    this.hitbox.update(this.pos, this.yaw, this.crouch, this.pitch, WEAPON_INDEX[this.w] ?? 'pistol');
 
     const ground = (this.flags & F.ground) !== 0;
     const ev = { step: false, land: false, jump: false };
@@ -225,6 +225,9 @@ export class GameClient implements PlayerHooks {
   private lastDraft: DraftCard | null = null;
   /** Exposed by an enemy's awakened recon (local clock). */
   private vulnUntil = 0;
+  /** Shooting-range accuracy stats (trigger pulls, pulls that hit, headshot pulls, kills, time-to-kill). */
+  private rangeStats = { shots: 0, hits: 0, heads: 0, kills: 0, last: '', ttk: 0 };
+  private rangeFirstHit = new Map<string, number>();
 
   constructor(
     private deps: ClientDeps,
@@ -252,7 +255,7 @@ export class GameClient implements PlayerHooks {
       peerJoined: (id, name) => this.host?.peerJoined(id, name),
       peerLeft: (id) => {
         if (this.host) this.host.peerLeft(id);
-        else if (id === 'host') this.deps.onLeave('호스트와의 연결이 끊어졌습니다.');
+        else if (id === 'host') this.deps.onLeave(`호스트와의 연결이 끊어졌습니다.${net.lostReason ? ` (${net.lostReason})` : ''}`);
       },
     };
     if (!net.isHost) net.toHost({ t: 'hello', name: settings.value.playerName, version: PROTOCOL_VERSION });
@@ -272,6 +275,11 @@ export class GameClient implements PlayerHooks {
 
   private sendPing(): void {
     this.net.toHost({ t: 'ping', c: performance.now(), rtt: this.rtt });
+  }
+
+  /** Offline shooting range (the host lives in this tab). */
+  get range(): boolean {
+    return this.host?.range ?? false;
   }
 
   get me(): PlayerInfo | undefined {
@@ -331,15 +339,29 @@ export class GameClient implements PlayerHooks {
       case 'draftOffer':
         this.draftCards = msg.cards;
         this.lastDraft = null;
-        ui.draft.show(msg.pick, msg.total, msg.cards, this.toLocal(msg.endsAt), this.me?.abilities ?? []);
+        ui.draft.show(msg.pick, msg.total, msg.cards, this.toLocal(msg.endsAt), this.me?.abilities ?? [], msg.bonus ?? false);
         this.deps.input.exitLock();
+        if (msg.bonus) audio.roundStart();
         break;
       case 'draftWait':
+        if (msg.bonus) {
+          // Bonus card taken mid buy phase: back to the shop / the round.
+          if (this.lastDraft) ui.hud.toast(`추가 증강 · ${ABILITIES[this.lastDraft.ability].tiers[this.lastDraft.tier].title}`, 'good', 2.2);
+          window.setTimeout(() => {
+            if (this.disposed || !ui.draft.bonusPicked) return;
+            ui.draft.hide();
+            if (this.phase === 'buy' && !ui.shop.open && !ui.needsCursor) this.deps.input.requestLock();
+          }, 650);
+          break;
+        }
         // The roster update with the new pick arrives right after; preview it now.
         ui.draft.waiting(this.lastDraft ? applyPick(this.me?.abilities ?? [], this.lastDraft) : (this.me?.abilities ?? []));
         break;
       case 'roundStart':
         this.onRoundStart(msg.round, msg.spawns);
+        break;
+      case 'respawn':
+        this.onRespawn(msg.id, msg.pos, msg.yaw);
         break;
       case 'coins':
         this.coins.set(msg.list);
@@ -450,7 +472,8 @@ export class GameClient implements PlayerHooks {
     const ui = this.deps.ui;
     const map = this.deps.map;
     map.setSpawnBarriers(phase === 'buy');
-    ui.pause.setHostEnd(this.net.isHost && phase !== 'lobby' ? () => this.net.toHost({ t: 'toLobby' }) : null);
+    ui.pause.setHostEnd(this.net.isHost && phase !== 'lobby' && !this.range ? () => this.net.toHost({ t: 'toLobby' }) : null);
+    ui.hud.setRangeMode(this.range);
     if (phase === 'lobby' || phase === 'draft') this.hideBodies();
     if (phase === 'lobby') {
       ui.hud.show(false);
@@ -477,6 +500,11 @@ export class GameClient implements PlayerHooks {
       this.deps.audio.startAmbient();
       ui.hud.banner(`ROUND ${round}`, '구매 단계 · B 키로 상점', 'neutral', 2.4);
       if (this.shopAuto) this.openShop(true);
+    } else if (phase === 'live' && this.range) {
+      ui.hud.show(true);
+      this.deps.audio.startAmbient();
+      this.local.unlimitedReserve = true;
+      ui.hud.banner('사격장', 'B 무기 선택 · 표적은 쓰러지면 다시 일어섭니다 · BACKSPACE 기록 초기화', 'team0', 3.2);
     } else if (phase === 'live') {
       this.openShop(false);
       ui.hud.banner('전투 개시', `${this.matchSettings.mode.toUpperCase()} · 적 전원을 처치하라`, this.myTeam === 0 ? 'team0' : 'team1', 1.8);
@@ -545,6 +573,28 @@ export class GameClient implements PlayerHooks {
         }
       }
     }
+  }
+
+  /** Shooting range: a single player (or target) is back on their feet. */
+  private onRespawn(id: string, pos: [number, number, number], yaw: number): void {
+    if (id === this.selfId) {
+      this.local.spawn(new THREE.Vector3(...pos), yaw);
+      this.deathCam = null;
+      this.spectating = null;
+      this.selfAvatar.revive();
+      this.selfAvatar.root.visible = false;
+      this.vm.setWeapon(this.local.current, 0.5);
+      this.deps.ui.hud.setCenter(null);
+      return;
+    }
+    const r = this.remotes.get(id);
+    if (!r) return;
+    r.teleport(pos[0], pos[1], pos[2], yaw);
+    r.minT = this.hostNow - 30;
+    r.alive = true;
+    r.avatar.revive();
+    r.avatar.root.visible = true;
+    this.rangeFirstHit.delete(id);
   }
 
   /** Clears corpses left from the previous match (lobby / draft show an empty map). */
@@ -683,6 +733,12 @@ export class GameClient implements PlayerHooks {
       );
     }
     const kpos = killerId === this.selfId ? this.local.motor.body.pos : this.remotes.get(killerId)?.pos;
+    if (killerId === this.selfId && victimId !== this.selfId && this.range) {
+      const first = this.rangeFirstHit.get(victimId);
+      this.rangeStats.kills++;
+      this.rangeStats.ttk = first !== undefined ? (performance.now() - first) / 1000 : 0;
+      this.rangeFirstHit.delete(victimId);
+    }
     if (killerId === this.selfId && victimId !== this.selfId) {
       ui.hud.hitmarker(head, true);
       this.deps.audio.killConfirm(head);
@@ -752,10 +808,11 @@ export class GameClient implements PlayerHooks {
     const world = this.deps.map.world;
     const [x, y, z] = msg.pos;
     const w = msg.width;
-    const hgt = 2.4;
+    const hgt = BARRIER_HEIGHT;
+    const d = BARRIER_HALF_DEPTH;
     const alongX = msg.yaw === 0;
-    const min = alongX ? new THREE.Vector3(x - w / 2, y, z - 0.14) : new THREE.Vector3(x - 0.14, y, z - w / 2);
-    const max = alongX ? new THREE.Vector3(x + w / 2, y + hgt, z + 0.14) : new THREE.Vector3(x + 0.14, y + hgt, z + w / 2);
+    const min = alongX ? new THREE.Vector3(x - w / 2, y, z - d) : new THREE.Vector3(x - d, y, z - w / 2);
+    const max = alongX ? new THREE.Vector3(x + w / 2, y + hgt, z + d) : new THREE.Vector3(x + d, y + hgt, z + w / 2);
     const collider = world.add(min, max, { tag: 'barrier', ref: msg.bid });
     const group = new THREE.Group();
     group.position.set(x, y, z);
@@ -766,7 +823,7 @@ export class GameClient implements PlayerHooks {
     wall.renderOrder = 6;
     group.add(wall);
     const pylonMat = new THREE.MeshStandardMaterial({ color: 0x24282e, metalness: 0.8, roughness: 0.35 });
-    const glow = new THREE.MeshBasicMaterial({ color: new THREE.Color(TEAMS[msg.team].color).multiplyScalar(4) });
+    const glow = new THREE.MeshBasicMaterial({ color: new THREE.Color(TEAMS[msg.team].color).multiplyScalar(2.6) });
     for (const sx of [-1, 1]) {
       const py = new THREE.Mesh(new THREE.BoxGeometry(0.16, hgt + 0.15, 0.22), pylonMat);
       py.position.set((sx * w) / 2, (hgt + 0.15) / 2, 0);
@@ -832,7 +889,7 @@ export class GameClient implements PlayerHooks {
       this.shake = Math.min(1, this.shake + (def.id === 'sniper' || def.id === 'shotgun' ? 0.25 : def.id === 'magnum' ? 0.18 : 0.05));
     }
     const muzzle = this.muzzleWorld();
-    const perTarget = new Map<string, { dmg: number; head: boolean; dist: number }>();
+    const perTarget = new Map<string, { dmg: number; zone: HitZone; dist: number; point: THREE.Vector3 }>();
     const perBarrier = new Map<string, number>();
     const hits: ShotHit[] = [];
     shots.forEach((s, i) => {
@@ -846,11 +903,15 @@ export class GameClient implements PlayerHooks {
         if (melee) audio.impact(tr.point);
       } else if (tr.kind === 'player' && tr.playerId) {
         this.effects.blood(tr.point, s.dir, tr.zone === 'head');
+        const zone = tr.zone ?? 'body';
         const cur = perTarget.get(tr.playerId);
         if (cur) {
           cur.dmg += s.damage;
-          cur.head ||= tr.zone === 'head';
-        } else perTarget.set(tr.playerId, { dmg: s.damage, head: tr.zone === 'head', dist: tr.dist });
+          if (ZONE_PRIORITY[zone] > ZONE_PRIORITY[cur.zone]) {
+            cur.zone = zone;
+            cur.point.copy(tr.point);
+          }
+        } else perTarget.set(tr.playerId, { dmg: s.damage, zone, dist: tr.dist, point: tr.point.clone() });
         if (melee) audio.knifeHit();
       } else if (tr.kind === 'barrier' && tr.barrierId) {
         this.effects.barrierHit(tr.point, TEAMS[this.barriers.get(tr.barrierId)?.msg.team ?? 0].color);
@@ -858,13 +919,41 @@ export class GameClient implements PlayerHooks {
       }
     });
     this.net.toHost({ t: 'fire', w: def.id, o: v3(origin), hits });
+    if (this.range && !melee) {
+      const st = this.rangeStats;
+      st.shots++;
+      if (perTarget.size) st.hits++;
+      if ([...perTarget.values()].some((r) => r.zone === 'head')) st.heads++;
+    }
     for (const [target, r] of perTarget) {
       if (r.dmg <= 0) continue;
-      this.net.toHost({ t: 'hit', target, dmg: Math.round(r.dmg * 100) / 100, zone: r.head ? 'head' : 'body', w: def.id, dist: r.dist });
-      this.deps.ui.hud.hitmarker(r.head, false);
-      audio.hitmarker(r.head);
+      const head = r.zone === 'head';
+      this.net.toHost({ t: 'hit', target, dmg: Math.round(r.dmg * 100) / 100, zone: r.zone, w: def.id, dist: r.dist });
+      this.deps.ui.hud.hitmarker(head, false, r.zone === 'arms' || r.zone === 'legs');
+      audio.hitmarker(head);
+      if (this.range) this.rangeHit(target, r.point, r.dmg, r.zone, r.dist);
     }
     for (const [bid, dmg] of perBarrier) this.net.toHost({ t: 'barrierDmg', bid, dmg });
+  }
+
+  /** Shooting range: floating damage number at the impact plus the "last hit" readout. */
+  private rangeHit(target: string, point: THREE.Vector3, dmg: number, zone: HitZone, dist: number): void {
+    if (!this.rangeFirstHit.has(target)) this.rangeFirstHit.set(target, performance.now());
+    this.rangeStats.last = `${ZONE_NAME[zone]} ${Math.round(dmg)} · ${dist.toFixed(1)}m`;
+    const p = point.clone().project(this.deps.renderer.camera);
+    if (p.z > 1) return;
+    this.deps.ui.hud.damageNumber((p.x * 0.5 + 0.5) * window.innerWidth, (-p.y * 0.5 + 0.5) * window.innerHeight, Math.round(dmg), zone);
+  }
+
+  private updateRangePanel(): void {
+    const st = this.rangeStats;
+    const pct = (n: number): string => (st.shots ? `${Math.round((n / st.shots) * 100)}%` : '—');
+    this.deps.ui.hud.setRangeStats([
+      ['명중률', `${pct(st.hits)} (${st.hits}/${st.shots})`],
+      ['헤드샷', `${pct(st.heads)} (${st.heads})`],
+      ['처치', `${st.kills}${st.ttk > 0 ? ` · TTK ${st.ttk.toFixed(2)}s` : ''}`],
+      ['마지막 명중', st.last || '—'],
+    ]);
   }
 
   private muzzleWorld(): THREE.Vector3 {
@@ -1042,7 +1131,7 @@ export class GameClient implements PlayerHooks {
   // ---------------------------------------------------------------------------
   openShop(on: boolean): void {
     const ui = this.deps.ui;
-    const can = on && this.phase === 'buy' && this.local.alive;
+    const can = on && (this.phase === 'buy' || (this.range && this.phase === 'live')) && this.local.alive;
     ui.shop.show(can);
     if (can) this.deps.input.exitLock();
   }
@@ -1109,7 +1198,12 @@ export class GameClient implements PlayerHooks {
 
     // UI hotkeys (raw so they work with the cursor visible)
     if (!ui.chat.open && !ui.pause.visible) {
-      if (inGame && input.keyPressed('KeyB') && this.phase === 'buy') this.toggleShop();
+      if (inGame && input.keyPressed('KeyB') && (this.phase === 'buy' || this.range)) this.toggleShop();
+      if (this.range && input.keyPressed('Backspace')) {
+        this.rangeStats = { shots: 0, hits: 0, heads: 0, kills: 0, last: '', ttk: 0 };
+        this.rangeFirstHit.clear();
+        ui.hud.toast('사격장 기록 초기화', 'info', 1.2);
+      }
       if (input.keyPressed('Enter') && !ui.modal.visible && this.phase !== 'draft') {
         ui.chat.openInput();
         input.exitLock();
@@ -1211,8 +1305,9 @@ export class GameClient implements PlayerHooks {
     this.updateGrade(dt);
     this.updateHud(dt);
     ui.draft.update();
-    ui.shop.update(this.me, Math.max(0, (this.toLocal(this.phaseEndsAt) - now) / 1000));
-    if (this.phase !== 'buy' && ui.shop.open) ui.shop.show(false);
+    ui.shop.update(this.me, Math.max(0, (this.toLocal(this.phaseEndsAt) - now) / 1000), this.scores[this.myTeam === 0 ? 1 : 0], this.range);
+    if (this.phase !== 'buy' && !this.range && ui.shop.open) ui.shop.show(false);
+    if (this.range) this.updateRangePanel();
 
     // Click-to-play prompt
     const needPrompt = canPlay && !input.locked && !ui.needsCursor;
@@ -1277,9 +1372,9 @@ export class GameClient implements PlayerHooks {
       cam.position.copy(eye);
       cam.rotation.order = 'YXZ';
       cam.rotation.set(
-        this.local.pitch + this.local.recoilPitch + Math.sin(t * 37) * 0.012 * shake,
+        this.local.pitch + this.local.recoilPitch + this.local.punchPitch + Math.sin(t * 37) * 0.012 * shake,
         this.local.yaw + this.local.recoilYaw + Math.sin(t * 29) * 0.012 * shake,
-        Math.sin(t * 23) * 0.01 * shake,
+        this.local.punchRoll + Math.sin(t * 23) * 0.01 * shake,
       );
       const zoom = lerp(1, this.local.def.ads.zoom, this.local.adsT);
       const fovMult = (1 / zoom) * (1 + this.dashFov * 0.08 + (this.local.adrenalineT > 0 ? 0.04 : 0));
@@ -1389,7 +1484,7 @@ export class GameClient implements PlayerHooks {
     const inGame = this.phase === 'buy' || this.phase === 'live' || this.phase === 'roundEnd' || this.phase === 'matchEnd';
     if (!inGame) return;
     const timeLeft = Math.max(0, (this.toLocal(this.phaseEndsAt) - now) / 1000);
-    const phaseLabel = this.phase === 'buy' ? '구매' : this.phase === 'live' ? '전투' : this.phase === 'roundEnd' ? '라운드 종료' : '매치 종료';
+    const phaseLabel = this.range ? '사격장' : this.phase === 'buy' ? '구매' : this.phase === 'live' ? '전투' : this.phase === 'roundEnd' ? '라운드 종료' : '매치 종료';
     const a = l.ammo.get(l.current);
     const abilities: HudAbility[] = l.abilities.map((ab) => {
       let active = 0;
@@ -1421,6 +1516,7 @@ export class GameClient implements PlayerHooks {
         abilities,
         synergies: activeSynergies(l.owned),
         timer: timeLeft,
+        clock: this.range ? '∞' : undefined,
         phaseLabel,
         scores: this.scores,
         round: this.round,
@@ -1434,7 +1530,7 @@ export class GameClient implements PlayerHooks {
         fps: this.fpsAcc.fps,
         showFps: st.showFps,
         spectating: null,
-        buyPhase: this.phase === 'buy' && !ui.shop.open && l.alive,
+        buyPhase: (this.phase === 'buy' || this.range) && !ui.shop.open && l.alive,
         adrenaline: l.adrenalineT,
         cloak: l.cloakT,
         suppressed: l.alive ? l.suppressT : 0,

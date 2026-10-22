@@ -208,7 +208,9 @@ export class GameRenderer {
     this.vmPass = new RenderPass(this.vmScene, this.vmCamera);
     this.vmPass.clear = false;
     this.vmPass.clearDepth = true;
-    this.bloom = new UnrealBloomPass(new THREE.Vector2(512, 512), 0.42, 0.5, 1.25);
+    // Restrained bloom: only genuinely hot sources (lamp lenses, the sun, muzzle flashes) glow,
+    // with a tight halo. Strength/radius/threshold were 0.42 / 0.5 / 1.25 and smeared every neon strip.
+    this.bloom = new UnrealBloomPass(new THREE.Vector2(512, 512), 0.16, 0.12, 1.8);
     this.output = new OutputPass();
     this.grade = new GradePass();
     this.rebuildChain();
@@ -280,6 +282,29 @@ export class GameRenderer {
     const v = 2 * Math.atan(Math.tan(THREE.MathUtils.degToRad(hfovDeg) / 2) / aspect);
     this.camera.fov = THREE.MathUtils.radToDeg(v);
     this.camera.updateProjectionMatrix();
+  }
+
+  /**
+   * Precompiles `scene`'s shaders for the variant frames really use. Every pass renders into the
+   * composer's linear, non-tone-mapped target, and both of those are part of a shader's cache key;
+   * compiling against the screen (the default) builds variants that are never used, so each
+   * material would still compile synchronously the first time it is drawn.
+   */
+  async precompile(scene: THREE.Scene, camera: THREE.Camera): Promise<void> {
+    const prev = this.renderer.getRenderTarget();
+    this.renderer.setRenderTarget(this.composer.readBuffer);
+    let done: Promise<unknown>;
+    try {
+      // The program lookup happens synchronously inside the call; only readiness polling is async.
+      done = this.renderer.compileAsync(scene, camera);
+    } finally {
+      this.renderer.setRenderTarget(prev);
+    }
+    try {
+      await done;
+    } catch {
+      // precompiling is an optimisation only
+    }
   }
 
   captureAfterimage(): void {

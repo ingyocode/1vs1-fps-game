@@ -63,8 +63,8 @@ export function createSkyDome(sunDir: THREE.Vector3, radius = 1800, withClouds =
         col = mix(col, zenith, smoothstep(0.35, 0.95, h));
 
         // Sun halo, glow and disc
-        col += vec3(1.6, 0.75, 0.32) * pow(sd, 8.0) * 0.9;
-        col += vec3(2.4, 1.3, 0.6) * pow(sd, 90.0) * 1.6;
+        col += vec3(1.6, 0.75, 0.32) * pow(sd, 8.0) * 0.6;
+        col += vec3(2.4, 1.3, 0.6) * pow(sd, 90.0) * 1.0;
         col += vec3(30.0, 22.0, 14.0) * smoothstep(0.99955, 0.99975, sd);
 
         // Clouds: a stratus band near the horizon and soft cirrus above

@@ -6,7 +6,7 @@ import type { CollisionWorld } from '../world/collision';
 import { F } from '../net/protocol';
 import { CharacterMotor } from './movement';
 import { WEAPONS, damageAt, type WeaponDef, type WeaponId } from './weapons';
-import { ABILITIES, CLOAK_FLICKER, ECHO_DELAY, SLOW_MULT, hasSynergy, stat, type AbilityId, type OwnedAbility, type ThrowKind, type Tier } from './abilities';
+import { ABILITIES, BARRIER_HALF_DEPTH, CLOAK_FLICKER, ECHO_DELAY, SLOW_MULT, hasSynergy, stat, type AbilityId, type OwnedAbility, type ThrowKind, type Tier } from './abilities';
 import { THROW_SPEED } from './projectiles';
 
 export interface TraceResult {
@@ -78,6 +78,9 @@ export class LocalPlayer {
   pitch = 0;
   recoilPitch = 0;
   recoilYaw = 0;
+  /** Visual-only camera kick on each shot (springs back fast, never moves the aim). */
+  punchPitch = 0;
+  punchRoll = 0;
   primary: WeaponId | null = null;
   secondary: WeaponId = 'pistol';
   current: WeaponId = 'pistol';
@@ -116,6 +119,8 @@ export class LocalPlayer {
   landDip = 0;
   time = 0;
   owned: OwnedAbility[] = [];
+  /** Shooting range: reloading never draws down the reserve. */
+  unlimitedReserve = false;
 
   constructor(private hooks: PlayerHooks) {}
 
@@ -178,6 +183,7 @@ export class LocalPlayer {
     this.yaw = yaw;
     this.pitch = 0;
     this.recoilPitch = this.recoilYaw = 0;
+    this.punchPitch = this.punchRoll = 0;
     this.alive = true;
     this.ammo.clear();
     for (const id of [this.primary, this.secondary]) if (id) this.ammo.set(id, { mag: WEAPONS[id].mag, reserve: WEAPONS[id].reserve });
@@ -240,7 +246,7 @@ export class LocalPlayer {
     if (!a) return;
     const take = Math.min(def.mag - a.mag, a.reserve);
     a.mag += take;
-    a.reserve -= take;
+    if (!this.unlimitedReserve) a.reserve -= take;
   }
 
   // ---------------------------------------------------------------------------
@@ -364,6 +370,9 @@ export class LocalPlayer {
       if (sinceShot > interval * 2.5) this.shotIndex = 0;
     }
     this.bloom = Math.max(0, this.bloom - dt * def.spread.recover);
+    const punchK = Math.exp(-dt * 16);
+    this.punchPitch *= punchK;
+    this.punchRoll *= punchK;
 
     // Pending grenade release (cancelled — charge refunded — if combat ended meanwhile)
     if (this.pendingThrow && !f.canUseAbilities) {
@@ -425,7 +434,7 @@ export class LocalPlayer {
     if (s.phase === 'start' || s.phase === 'shell') {
       if (s.phase === 'shell') {
         a.mag++;
-        a.reserve--;
+        if (!this.unlimitedReserve) a.reserve--;
         this.hooks.onReloadEvent('shell');
       }
       if (a.mag < def.mag && a.reserve > 0) {
@@ -489,12 +498,16 @@ export class LocalPlayer {
 
     // Recoil: pattern + jitter, kicks the view (CS-style aim punch).
     const pat = def.recoil.pattern;
-    const [pp, py] = this.shotIndex < pat.length ? pat[this.shotIndex] : [def.recoil.tail[0], (Math.random() - 0.5) * 0.012];
+    const [pp, py] = this.shotIndex < pat.length ? pat[this.shotIndex] : [def.recoil.tail[0], (Math.random() - 0.5) * 0.017];
     const adsK = lerp(1, 0.82, this.adsT);
     const crouchK = this.motor.crouch > 0.5 ? 0.85 : 1;
     this.recoilPitch += (pp + (Math.random() - 0.5) * def.recoil.jitter) * adsK * crouchK;
     this.recoilYaw += (py + (Math.random() - 0.5) * def.recoil.jitter) * adsK * crouchK;
-    this.recoilPitch = Math.min(this.recoilPitch, 0.3);
+    this.recoilPitch = Math.min(this.recoilPitch, 0.34);
+    // Camera punch: even the first (pattern-free) round of a spray visibly kicks the view.
+    const kick = Math.max(pp, def.recoil.tail[0]) * 0.55 + 0.004;
+    this.punchPitch = Math.min(0.09, this.punchPitch + kick * adsK);
+    this.punchRoll += (Math.random() - 0.5) * kick * 0.9;
     this.shotIndex++;
     this.bloom = Math.min(def.spread.bloomMax, this.bloom + def.spread.bloom);
     this.lastShotAt = this.time;
@@ -594,13 +607,17 @@ export class LocalPlayer {
         case 'barrier': {
           const flat = new THREE.Vector3(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
           const eye = this.eye;
-          let dist = 2.2;
+          const yaw = Math.abs(flat.z) >= Math.abs(flat.x) ? 0 : Math.PI / 2;
+          // The wall snaps to an axis, so looking diagonally its thin side sits closer than `dist`.
+          // Keep it clear of our own body, or the collider would spawn around us.
+          const thin = yaw === 0 ? Math.abs(flat.z) : Math.abs(flat.x);
+          const minDist = (BARRIER_HALF_DEPTH + this.motor.body.radius + 0.08) / thin;
+          let dist = Math.max(2.2, minDist);
           const hit = world.raycast(eye, flat, 2.6, true);
-          if (hit) dist = Math.max(0.6, hit.dist - 0.45);
+          if (hit) dist = Math.max(minDist, hit.dist - 0.45);
           const p = this.motor.body.pos.clone().addScaledVector(flat, dist);
           const g = world.groundBelow(new THREE.Vector3(p.x, p.y + 1.2, p.z), 0.05, 4);
           if (g !== null) p.y = g;
-          const yaw = Math.abs(flat.z) >= Math.abs(flat.x) ? 0 : Math.PI / 2;
           this.hooks.onBarrier(p, yaw, a.tier);
           break;
         }

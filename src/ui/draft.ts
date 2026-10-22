@@ -1,6 +1,6 @@
 import { h, clear, setText } from './dom';
 import { ABILITY_ICONS } from './icons';
-import { ABILITIES, MAX_TIER, TIERS, activeSynergies, synergyPartners, type DraftCard, type OwnedAbility, type Tier } from '../game/abilities';
+import { ABILITIES, BONUS_PICK_LOSSES, MAX_TIER, TIERS, activeSynergies, synergyPartners, type DraftCard, type OwnedAbility, type Tier } from '../game/abilities';
 import type { AudioEngine } from '../audio/audio';
 
 const TYPE_LABEL = { throw: '투척', self: '자가 강화', deploy: '설치' } as const;
@@ -16,6 +16,9 @@ export class DraftView {
   private waitEl: HTMLElement;
   private cards: DraftCard[] = [];
   private picked = false;
+  private bonus = false;
+  private subEl: HTMLElement;
+  private kickerEl: HTMLElement;
   private endsAt = 0;
   private total = 15;
   private keyHandler = (e: KeyboardEvent): void => {
@@ -30,6 +33,8 @@ export class DraftView {
     private onPick: (index: number) => void,
   ) {
     this.titleEl = h('div', { class: 'draft-title' });
+    this.kickerEl = h('div', { class: 'draft-kicker' }, 'ABILITY DRAFT');
+    this.subEl = h('div', { class: 'draft-sub' });
     this.timerEl = h('div', { class: 'draft-timer-num' }, '15');
     const svgNS = 'http://www.w3.org/2000/svg';
     const svg = document.createElementNS(svgNS, 'svg');
@@ -57,9 +62,9 @@ export class DraftView {
       h(
         'div',
         { class: 'draft-head' },
-        h('div', { class: 'draft-kicker' }, 'ABILITY DRAFT'),
+        this.kickerEl,
         this.titleEl,
-        h('div', { class: 'draft-sub' }, '카드 한 장을 고르세요. 보유한 능력은 다음 단계 강화 카드로 등장하며 Ⅲ단계에서 각성합니다. 특정 조합은 시너지를 발동합니다.'),
+        this.subEl,
         h('div', { class: 'draft-timer' }, svg as unknown as HTMLElement, this.timerEl),
       ),
       this.cardsEl,
@@ -70,14 +75,24 @@ export class DraftView {
     window.addEventListener('keydown', this.keyHandler);
   }
 
-  show(pick: number, total: number, cards: DraftCard[], endsAtLocal: number, owned: OwnedAbility[]): void {
+  /** `bonus`: an extra card earned by losing rounds (shown over the buy phase). */
+  show(pick: number, total: number, cards: DraftCard[], endsAtLocal: number, owned: OwnedAbility[], bonus = false): void {
     this.cards = cards;
     this.picked = false;
+    this.bonus = bonus;
     this.endsAt = endsAtLocal;
     this.total = Math.max(1, (endsAtLocal - performance.now()) / 1000);
     this.root.classList.remove('hidden');
+    this.root.classList.toggle('bonus', bonus);
     this.waitEl.classList.add('hidden');
-    setText(this.titleEl, `능력 선택 ${pick} / ${total}`);
+    setText(this.kickerEl, bonus ? 'COMEBACK AUGMENT' : 'ABILITY DRAFT');
+    setText(this.titleEl, bonus ? `추가 증강${total > 1 ? ` · 남은 ${total}장` : ''}` : `능력 선택 ${pick} / ${total}`);
+    setText(
+      this.subEl,
+      bonus
+        ? `라운드 ${BONUS_PICK_LOSSES}패 보상입니다. 구매 단계가 끝나기 전에 고르세요 — 시간이 지나면 무작위로 선택됩니다.`
+        : '카드 한 장을 고르세요. 보유한 능력은 다음 단계 강화 카드로 등장하며 Ⅲ단계에서 각성합니다. 특정 조합은 시너지를 발동합니다.',
+    );
     clear(this.cardsEl);
     cards.forEach((c, i) => this.cardsEl.append(this.renderCard(c, i, owned)));
     cards.forEach((c, i) => this.audio.cardReveal(c.tier + 1, 0.12 + i * 0.16));
@@ -167,6 +182,12 @@ export class DraftView {
 
   hide(): void {
     this.root.classList.add('hidden');
+    this.bonus = false;
+  }
+
+  /** A bonus card was chosen and the overlay is waiting to close. */
+  get bonusPicked(): boolean {
+    return this.bonus && this.picked;
   }
 
   get visible(): boolean {

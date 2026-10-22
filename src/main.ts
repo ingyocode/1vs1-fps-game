@@ -11,6 +11,7 @@ import { UI } from './ui/ui';
 import { Net } from './net/network';
 import { MatchHost } from './game/host';
 import { GameClient } from './game/client';
+import { warmupShaders } from './game/warmup';
 import type { MatchSettings } from './net/protocol';
 import type { TeamId } from './core/config';
 
@@ -39,6 +40,7 @@ class App {
         host: () => void this.hostGame(),
         join: (code) => void this.joinGame(code),
         practice: (s) => this.practice(s),
+        range: () => this.range(),
       },
       lobby: {
         setTeam: (t: TeamId) => this.session?.net.toHost({ t: 'setTeam', team: t }),
@@ -78,15 +80,13 @@ class App {
     await nextFrame();
     this.map = buildMap(lib);
     this.renderer.scene.add(this.map.root);
-    load.set(0.94, '셰이더 컴파일 중…');
+    load.set(0.92, '셰이더 컴파일 중…');
     await nextFrame();
     this.renderer.camera.position.set(0, 14, 24);
     this.renderer.camera.lookAt(0, 2, 0);
-    try {
-      await this.renderer.renderer.compileAsync(this.renderer.scene, this.renderer.camera);
-    } catch {
-      // compileAsync is an optimisation only
-    }
+    // Match shaders first (characters, guns, effects), then the map with its final light set.
+    await warmupShaders(this.renderer);
+    await this.renderer.precompile(this.renderer.scene, this.renderer.camera);
     load.set(1, '완료');
     this.ui.hud.setRadarMap(this.map.radar, this.map.bounds);
 
@@ -111,6 +111,12 @@ class App {
     this.renderer.setQuality(s.quality, s.renderScale);
     this.env.setQuality(s.quality);
     this.audio.setVolume(s.masterVolume);
+  }
+
+  /** Any phase of a running match (draft included), i.e. something a reload would throw away. */
+  private inMatch(): boolean {
+    const p = this.session?.phase;
+    return p === 'draft' || p === 'buy' || p === 'live' || p === 'roundEnd' || p === 'matchEnd';
   }
 
   private inGamePhase(): boolean {
@@ -152,7 +158,14 @@ class App {
       }
       if (this.session && this.inGamePhase() && !this.input.locked && !this.ui.chat.open) this.setPaused(true);
     });
-    window.addEventListener('beforeunload', () => this.session?.dispose());
+    // Leaving mid-match (reload, closing the tab, ⌘Q) asks first instead of dropping the game;
+    // the session is only torn down once the page is really going away.
+    window.addEventListener('beforeunload', (e) => {
+      if (!this.session || !this.inMatch() || this.session.range) return;
+      e.preventDefault();
+      e.returnValue = '';
+    });
+    window.addEventListener('pagehide', () => this.session?.dispose());
   }
 
   private resume(): void {
@@ -214,6 +227,15 @@ class App {
     this.startSession(net, host, true);
     host.fillBots();
     host.tryStart();
+  }
+
+  /** Offline shooting range on the warehouse lane. */
+  range(): void {
+    if (this.busy || this.session) return;
+    const net = Net.offline();
+    const host = new MatchHost(net, this.map, settings.value.playerName);
+    this.startSession(net, host, true);
+    host.startRange();
   }
 
   private startSession(net: Net, host: MatchHost | null, offline: boolean): void {

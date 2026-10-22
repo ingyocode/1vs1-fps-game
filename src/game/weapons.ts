@@ -12,6 +12,8 @@ export interface WeaponDef {
   price: number;
   damage: number;
   headMult: number;
+  /** Upper/fore-arm hits. */
+  armMult: number;
   legMult: number;
   pellets: number;
   rpm: number;
@@ -38,19 +40,20 @@ export interface WeaponDef {
   killReward: number;
 }
 
+/** Rifle spray (pitch, yaw per shot): climbs hard for ~6 rounds, then walks left and right. */
 const riflePattern: [number, number][] = [
   [0.0, 0.0],
-  [0.011, 0.0005],
-  [0.013, -0.001],
-  [0.015, 0.0015],
-  [0.016, 0.002],
-  [0.016, -0.0025],
-  [0.014, -0.0045],
-  [0.012, -0.005],
-  [0.01, 0.0045],
-  [0.008, 0.006],
-  [0.006, 0.006],
-  [0.005, -0.004],
+  [0.0145, 0.0008],
+  [0.017, -0.0015],
+  [0.0195, 0.002],
+  [0.021, 0.003],
+  [0.0205, -0.0035],
+  [0.018, -0.0065],
+  [0.0155, -0.0072],
+  [0.013, 0.0065],
+  [0.0105, 0.0085],
+  [0.008, 0.0085],
+  [0.0068, -0.006],
 ];
 
 export const WEAPONS: Record<WeaponId, WeaponDef> = {
@@ -63,6 +66,7 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
     price: 0,
     damage: 50,
     headMult: 1,
+    armMult: 1,
     legMult: 1,
     pellets: 1,
     rpm: 110,
@@ -80,7 +84,7 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
     tracer: 0,
     meleeRange: 2.3,
     bars: { damage: 0.5, rate: 0.4, accuracy: 1, mobility: 1, range: 0.05 },
-    killReward: 500,
+    killReward: 1000,
   },
   pistol: {
     id: 'pistol',
@@ -91,7 +95,8 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
     price: 0,
     damage: 26,
     headMult: 3.8,
-    legMult: 0.75,
+    armMult: 0.75,
+    legMult: 0.7,
     pellets: 1,
     rpm: 400,
     auto: false,
@@ -102,7 +107,7 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
     falloff: { start: 15, end: 40, minMult: 0.78 },
     armorPen: 0.2,
     spread: { hip: 0.008, ads: 0.004, move: 0.028, air: 0.12, crouch: 0.85, bloom: 0.012, bloomMax: 0.05, recover: 0.09 },
-    recoil: { pattern: [[0.012, 0]], tail: [0.012, 0], jitter: 0.004, recover: 0.4 },
+    recoil: { pattern: [[0.016, 0]], tail: [0.016, 0], jitter: 0.0055, recover: 0.4 },
     moveSpeed: 1.0,
     ads: { zoom: 1.15, time: 0.14, scope: false },
     tracer: 0xffd28a,
@@ -118,7 +123,8 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
     price: 700,
     damage: 55,
     headMult: 3,
-    legMult: 0.75,
+    armMult: 0.75,
+    legMult: 0.7,
     pellets: 1,
     rpm: 160,
     auto: false,
@@ -129,12 +135,12 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
     falloff: { start: 20, end: 55, minMult: 0.75 },
     armorPen: 0.55,
     spread: { hip: 0.012, ads: 0.0025, move: 0.06, air: 0.16, crouch: 0.85, bloom: 0.035, bloomMax: 0.08, recover: 0.12 },
-    recoil: { pattern: [[0.05, 0]], tail: [0.05, 0], jitter: 0.012, recover: 0.5 },
+    recoil: { pattern: [[0.062, 0]], tail: [0.062, 0], jitter: 0.015, recover: 0.5 },
     moveSpeed: 0.97,
     ads: { zoom: 1.2, time: 0.16, scope: false },
     tracer: 0xffc070,
     bars: { damage: 0.7, rate: 0.25, accuracy: 0.6, mobility: 0.95, range: 0.65 },
-    killReward: 250,
+    killReward: 300,
   },
   smg: {
     id: 'smg',
@@ -145,7 +151,8 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
     price: 1300,
     damage: 22,
     headMult: 2.6,
-    legMult: 0.8,
+    armMult: 0.75,
+    legMult: 0.7,
     pellets: 1,
     rpm: 860,
     auto: true,
@@ -159,20 +166,20 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
     recoil: {
       pattern: [
         [0, 0],
-        [0.006, 0.0005],
-        [0.007, -0.001],
-        [0.007, 0.0015],
-        [0.006, -0.0015],
+        [0.008, 0.0007],
+        [0.009, -0.0014],
+        [0.0092, 0.002],
+        [0.008, -0.002],
       ],
-      tail: [0.004, 0],
-      jitter: 0.003,
+      tail: [0.0055, 0],
+      jitter: 0.0042,
       recover: 0.35,
     },
     moveSpeed: 1.0,
     ads: { zoom: 1.25, time: 0.16, scope: false },
     tracer: 0xffd28a,
     bars: { damage: 0.35, rate: 0.95, accuracy: 0.5, mobility: 0.95, range: 0.35 },
-    killReward: 300,
+    killReward: 500,
   },
   shotgun: {
     id: 'shotgun',
@@ -183,7 +190,8 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
     price: 1600,
     damage: 15,
     headMult: 1.6,
-    legMult: 0.8,
+    armMult: 0.8,
+    legMult: 0.75,
     pellets: 9,
     rpm: 72,
     auto: false,
@@ -195,12 +203,12 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
     falloff: { start: 6, end: 20, minMult: 0.25 },
     armorPen: 0.3,
     spread: { hip: 0.068, ads: 0.055, move: 0.008, air: 0.02, crouch: 0.95, bloom: 0, bloomMax: 0, recover: 0.2 },
-    recoil: { pattern: [[0.06, 0]], tail: [0.06, 0], jitter: 0.012, recover: 0.45 },
+    recoil: { pattern: [[0.076, 0]], tail: [0.076, 0], jitter: 0.016, recover: 0.45 },
     moveSpeed: 0.95,
     ads: { zoom: 1.1, time: 0.18, scope: false },
     tracer: 0xffb060,
     bars: { damage: 0.95, rate: 0.15, accuracy: 0.2, mobility: 0.9, range: 0.15 },
-    killReward: 300,
+    killReward: 600,
   },
   rifle: {
     id: 'rifle',
@@ -211,7 +219,8 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
     price: 2900,
     damage: 38,
     headMult: 4,
-    legMult: 0.8,
+    armMult: 0.75,
+    legMult: 0.7,
     pellets: 1,
     rpm: 620,
     auto: true,
@@ -222,12 +231,12 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
     falloff: { start: 30, end: 75, minMult: 0.85 },
     armorPen: 0.5,
     spread: { hip: 0.0065, ads: 0.0018, move: 0.065, air: 0.16, crouch: 0.8, bloom: 0.0055, bloomMax: 0.04, recover: 0.1 },
-    recoil: { pattern: riflePattern, tail: [0.005, 0], jitter: 0.004, recover: 0.38 },
+    recoil: { pattern: riflePattern, tail: [0.0072, 0], jitter: 0.0055, recover: 0.38 },
     moveSpeed: 0.92,
     ads: { zoom: 1.45, time: 0.2, scope: false },
     tracer: 0xffe0a0,
     bars: { damage: 0.75, rate: 0.75, accuracy: 0.85, mobility: 0.75, range: 0.85 },
-    killReward: 250,
+    killReward: 300,
   },
   sniper: {
     id: 'sniper',
@@ -238,7 +247,8 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
     price: 4700,
     damage: 125,
     headMult: 2,
-    legMult: 0.85,
+    armMult: 0.8,
+    legMult: 0.75,
     pellets: 1,
     rpm: 40,
     auto: false,
@@ -249,7 +259,7 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
     falloff: { start: 120, end: 160, minMult: 1 },
     armorPen: 0.9,
     spread: { hip: 0.075, ads: 0.0004, move: 0.12, air: 0.25, crouch: 0.9, bloom: 0, bloomMax: 0, recover: 0.4 },
-    recoil: { pattern: [[0.085, 0]], tail: [0.085, 0], jitter: 0.015, recover: 0.6 },
+    recoil: { pattern: [[0.1, 0]], tail: [0.1, 0], jitter: 0.018, recover: 0.6 },
     moveSpeed: 0.84,
     ads: { zoom: 3.4, time: 0.24, scope: true },
     bolt: 1.25,
@@ -276,9 +286,18 @@ export function damageAt(def: WeaponDef, dist: number, zone: HitZone): number {
     const t = Math.min(1, (dist - f.start) / Math.max(0.001, f.end - f.start));
     mult = 1 + (f.minMult - 1) * t;
   }
-  const zm = zone === 'head' ? def.headMult : zone === 'legs' ? def.legMult : 1;
-  return def.damage * mult * zm;
+  return def.damage * mult * zoneMult(def, zone);
 }
+
+/** Damage multiplier of a hit zone (head > body > arms > legs). */
+export function zoneMult(def: WeaponDef, zone: HitZone): number {
+  return zone === 'head' ? def.headMult : zone === 'arms' ? def.armMult : zone === 'legs' ? def.legMult : 1;
+}
+
+/** Strongest zone wins when one trigger pull lands on several (shotgun pellets). */
+export const ZONE_PRIORITY: Record<HitZone, number> = { head: 3, body: 2, arms: 1, legs: 0 };
+
+export const ZONE_NAME: Record<HitZone, string> = { head: '머리', body: '몸통', arms: '팔', legs: '다리' };
 
 /** Applies armor. Returns hp damage and armor consumed. */
 export function applyArmor(dmg: number, armor: number, armorPen: number): { hp: number; armor: number } {

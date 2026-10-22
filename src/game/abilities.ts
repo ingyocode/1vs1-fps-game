@@ -14,8 +14,8 @@ export const TIERS: { roman: string; name: string; nameEn: string; color: string
   { roman: 'Ⅲ', name: '각성', nameEn: 'AWAKENED', color: '#ffb52e' },
 ];
 
-/** Gold cost to raise an owned ability from tier t to t+1 in the shop. */
-export const UPGRADE_COST: Record<0 | 1, number> = { 0: 1000, 1: 2400 };
+/** Abilities cannot be bought: every this many round losses a team drafts one extra card instead. */
+export const BONUS_PICK_LOSSES = 2;
 
 /** Movement multiplier while concussed. */
 export const SLOW_MULT = 0.65;
@@ -27,6 +27,10 @@ export const ECHO_DELAY = 1.8;
 export const CLOAK_FLICKER = 0.6;
 /** Poison added to the owner's smokes by the toxic synergy. */
 export const TOXIC_SYN_DPS = 8;
+/** Half thickness of a deployed barrier's collider. */
+export const BARRIER_HALF_DEPTH = 0.14;
+/** Barrier collider height. */
+export const BARRIER_HEIGHT = 2.4;
 
 export type ThrowKind = 'flash' | 'smoke' | 'frag';
 

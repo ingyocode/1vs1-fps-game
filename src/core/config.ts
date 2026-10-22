@@ -29,18 +29,27 @@ export const PLAYER = {
   maxArmor: 50,
 } as const;
 
+/**
+ * Economy, tuned against the full-buy price (AR-7 2900 + heavy armor 1000 = 3900):
+ * - a winner who died can rebuy right away (win 3000 + kill ~300 + a couple of coins ≥ 3900),
+ * - a loser can always force an SMG/shotgun + armor (loss 1900 + coins ≈ 2300–2600),
+ *   and two losses in a row fund a full buy even without coins (1900 + 2400 = 4300),
+ * - map coins stay a meaningful side income (~15–25% of a round) without beating the round result.
+ */
 export const ECON = {
   start: 800,
-  kill: 250,
-  headshotBonus: 100,
-  assist: 100,
-  win: 1100,
-  loss: 550,
-  lossStep: 200,
+  kill: 300,
+  headshotBonus: 150,
+  assist: 150,
+  win: 3000,
+  /** Draws pay between a loss and a win. */
+  draw: 2400,
+  loss: 1900,
+  lossStep: 500,
   lossMaxSteps: 3,
-  coinSmall: 100,
-  coinBig: 350,
-  max: 9000,
+  coinSmall: 200,
+  coinBig: 700,
+  max: 12000,
 } as const;
 
 export const TIMING = {
@@ -61,8 +70,8 @@ export const NET = {
   pingIntervalMs: 2000,
 } as const;
 
-/** Damage multipliers by hit zone. Weapons may override the head multiplier. */
-export type HitZone = 'head' | 'body' | 'legs';
+/** Hit zones. Each weapon defines its own head / arm / leg multipliers (body = 1). */
+export type HitZone = 'head' | 'body' | 'arms' | 'legs';
 
 export const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 

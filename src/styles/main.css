@@ -1381,6 +1381,11 @@ input[type='color'] {
   width: 13px;
 }
 
+.hitmarker.limb i {
+  background: #b9c2cc;
+  width: 8px;
+}
+
 .hitmarker.kill i {
   background: #ff3a4a;
   width: 16px;
@@ -2093,6 +2098,83 @@ input[type='color'] {
   background: var(--accent-2);
 }
 
+/* Shooting range */
+.range-panel {
+  position: absolute;
+  top: 196px;
+  left: 16px;
+  width: 276px;
+  padding: 10px 14px 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  clip-path: var(--cut);
+  backdrop-filter: blur(10px);
+  font-size: 13px;
+}
+
+.range-panel .rp-title {
+  font-family: var(--display);
+  font-size: 11px;
+  letter-spacing: 0.24em;
+  color: var(--accent-2);
+  margin-bottom: 6px;
+}
+
+.range-panel .rp-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 3px 0;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+}
+
+.range-panel .rp-row b {
+  color: var(--text);
+  font-family: var(--display);
+  font-weight: 600;
+}
+
+#hud.range .pips,
+#hud.range .round-label,
+#hud.range .score-num {
+  visibility: hidden;
+}
+
+.dmg-num {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  font-family: var(--display);
+  font-size: 20px;
+  font-weight: 700;
+  color: #f2f5f8;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+  pointer-events: none;
+  animation: dmgFloat 0.95s ease-out forwards;
+}
+
+.dmg-num.z-head {
+  color: #ffcf4a;
+  font-size: 25px;
+}
+
+.dmg-num.z-arms,
+.dmg-num.z-legs {
+  color: #a9b4c0;
+  font-size: 17px;
+}
+
+@keyframes dmgFloat {
+  0% {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1.25);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(calc(-50% + var(--dx, 0px)), -260%) scale(0.95);
+  }
+}
+
 .net-stats {
   position: absolute;
   right: 18px;
@@ -2183,6 +2265,14 @@ input[type='color'] {
   justify-content: center;
   gap: 26px;
   z-index: 30;
+}
+
+#draft.bonus .draft-kicker {
+  color: #ffb52e;
+}
+
+#draft.bonus .draft-bg {
+  background: radial-gradient(ellipse at 50% 40%, rgba(60, 38, 10, 0.55), rgba(4, 5, 9, 0.9) 70%);
 }
 
 .draft-bg {
@@ -2802,6 +2892,68 @@ input[type='color'] {
   font-size: 13px;
   color: var(--dim);
   padding: 12px;
+}
+
+.shop-item.static {
+  cursor: default;
+}
+
+.shop-item.static:hover {
+  transform: none;
+  border-color: var(--line);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.015));
+}
+
+.shop-item.static.owned:hover {
+  border-color: rgba(94, 240, 160, 0.45);
+  background: rgba(94, 240, 160, 0.06);
+}
+
+.shop-item.static .si-price {
+  font-size: 13px;
+  color: var(--rc, var(--gold));
+}
+
+.shop-bonus {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border: 1px dashed rgba(255, 181, 46, 0.45);
+  background: rgba(255, 181, 46, 0.05);
+  clip-path: var(--cut-s);
+}
+
+.shop-bonus .sb-title {
+  font-family: var(--display);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: #ffb52e;
+}
+
+.shop-bonus .sb-pips {
+  display: flex;
+  gap: 5px;
+}
+
+.shop-bonus .sb-pips i {
+  width: 14px;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.shop-bonus .sb-pips i.on {
+  background: #ffb52e;
+  box-shadow: 0 0 8px rgba(255, 181, 46, 0.6);
+}
+
+.shop-bonus .sb-text {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.45;
 }
 
 .shop-syn {

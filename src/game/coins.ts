@@ -74,13 +74,13 @@ export class CoinField {
     const group = new THREE.Group();
     group.position.set(...info.pos);
     group.add(coin);
-    const glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.glowTex, color: new THREE.Color(1.0, 0.7, 0.2).multiplyScalar(info.big ? 2.2 : 1.4), blending: THREE.AdditiveBlending, depthWrite: false, transparent: true }));
+    const glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.glowTex, color: new THREE.Color(1.0, 0.7, 0.2).multiplyScalar(info.big ? 1.6 : 1.05), blending: THREE.AdditiveBlending, depthWrite: false, transparent: true }));
     glow.scale.setScalar(r * 5);
     group.add(glow);
     const beamH = info.big ? 9 : 4;
     const beam = new THREE.Mesh(
       new THREE.CylinderGeometry(r * 0.9, r * 1.4, beamH, 16, 1, true),
-      new THREE.MeshBasicMaterial({ map: this.beamTexture, color: new THREE.Color(1, 0.65, 0.2).multiplyScalar(info.big ? 1.6 : 0.9), transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }),
+      new THREE.MeshBasicMaterial({ map: this.beamTexture, color: new THREE.Color(1, 0.65, 0.2).multiplyScalar(info.big ? 1.2 : 0.7), transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }),
     );
     beam.position.y = beamH / 2 - 0.5;
     group.add(beam);

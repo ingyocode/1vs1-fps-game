@@ -65,9 +65,9 @@ export class CollisionWorld {
   // Character movement (axis separated AABB sweep with step-up / ground snap)
   // ---------------------------------------------------------------------------
 
-  overlapsBody(pos: THREE.Vector3, radius: number, height: number, ignoreTag?: string): ColliderBox | null {
+  overlapsBody(pos: THREE.Vector3, radius: number, height: number, ignoreTag?: string, ignore?: readonly ColliderBox[]): ColliderBox | null {
     for (const b of this.boxes) {
-      if (!b.enabled || !b.blocksMove || b.tag === ignoreTag) continue;
+      if (!b.enabled || !b.blocksMove || b.tag === ignoreTag || ignore?.includes(b)) continue;
       if (
         pos.x - radius < b.max.x - EPS &&
         pos.x + radius > b.min.x + EPS &&
@@ -81,8 +81,22 @@ export class CollisionWorld {
     return null;
   }
 
+  /** Every movement-blocking box the body volume currently intersects. */
+  overlapping(pos: THREE.Vector3, radius: number, height: number, out: ColliderBox[] = []): ColliderBox[] {
+    out.length = 0;
+    for (const b of this.boxes) {
+      if (b.enabled && b.blocksMove && this.boxOverlap(pos, radius, height, b)) out.push(b);
+    }
+    return out;
+  }
+
   moveBody(body: BodyState, dt: number, stepHeight: number): { hitWall: boolean; hitCeiling: boolean; landed: number } {
     const wasGrounded = body.onGround;
+    // Boxes the body already intersects before moving (a barrier raised on top of a player,
+    // a spawn wall switching on) are left out of the sweep. Resolving them would snap the
+    // body to whichever face lies in the direction of travel: metres sideways, through the
+    // wall, or onto its top. They are pushed out of gently afterwards instead.
+    const stuck = this.overlapping(body.pos, body.radius, body.height, _stuck);
     const disp = _disp.copy(body.vel).multiplyScalar(dt);
     const steps = Math.min(24, Math.max(1, Math.ceil(Math.max(Math.abs(disp.x), Math.abs(disp.y), Math.abs(disp.z)) / 0.18)));
     disp.divideScalar(steps);
@@ -92,9 +106,9 @@ export class CollisionWorld {
     const fallSpeed = -body.vel.y;
     body.onGround = false;
     for (let i = 0; i < steps; i++) {
-      if (this.slideHorizontal(body, 'x', disp.x, wasGrounded || body.onGround, stepHeight)) hitWall = true;
-      if (this.slideHorizontal(body, 'z', disp.z, wasGrounded || body.onGround, stepHeight)) hitWall = true;
-      const v = this.slideVertical(body, disp.y);
+      if (this.slideHorizontal(body, 'x', disp.x, wasGrounded || body.onGround, stepHeight, stuck)) hitWall = true;
+      if (this.slideHorizontal(body, 'z', disp.z, wasGrounded || body.onGround, stepHeight, stuck)) hitWall = true;
+      const v = this.slideVertical(body, disp.y, stuck);
       if (v === 1) hitCeiling = true;
       if (v === -1 && !wasGrounded) landed = Math.max(landed, fallSpeed);
     }
@@ -118,23 +132,46 @@ export class CollisionWorld {
         body.vel.y = 0;
       }
     }
+    if (stuck.length) this.depenetrate(body, stuck, dt);
     return { hitWall, hitCeiling, landed };
   }
 
-  private slideHorizontal(body: BodyState, axis: 'x' | 'z', amount: number, canStep: boolean, stepHeight: number): boolean {
+  /**
+   * Walks the body out of boxes it started inside, along the shallowest horizontal axis,
+   * at a bounded speed (no teleport). A push that would enter other geometry is skipped.
+   */
+  private depenetrate(body: BodyState, stuck: readonly ColliderBox[], dt: number): void {
+    const p = body.pos;
+    const r = body.radius;
+    const maxStep = DEPEN_SPEED * dt;
+    for (const b of stuck) {
+      if (!b.enabled || !this.boxOverlap(p, r, body.height, b)) continue;
+      const pushX = p.x - b.min.x < b.max.x - p.x ? b.min.x - r - EPS * 2 - p.x : b.max.x + r + EPS * 2 - p.x;
+      const pushZ = p.z - b.min.z < b.max.z - p.z ? b.min.z - r - EPS * 2 - p.z : b.max.z + r + EPS * 2 - p.z;
+      const order: ['x' | 'z', number][] = Math.abs(pushX) <= Math.abs(pushZ) ? [['x', pushX], ['z', pushZ]] : [['z', pushZ], ['x', pushX]];
+      for (const [axis, push] of order) {
+        const step = Math.sign(push) * Math.min(Math.abs(push), maxStep);
+        p[axis] += step;
+        if (!this.overlapsBody(p, r, body.height, undefined, stuck)) break;
+        p[axis] -= step;
+      }
+    }
+  }
+
+  private slideHorizontal(body: BodyState, axis: 'x' | 'z', amount: number, canStep: boolean, stepHeight: number, stuck: readonly ColliderBox[]): boolean {
     if (amount === 0) return false;
     const p = body.pos;
     p[axis] += amount;
     let hit = false;
     for (const b of this.boxes) {
-      if (!b.enabled || !b.blocksMove) continue;
+      if (!b.enabled || !b.blocksMove || stuck.includes(b)) continue;
       if (!this.boxOverlap(p, body.radius, body.height, b)) continue;
       if (canStep) {
         const rise = b.max.y - p.y;
         if (rise > 0 && rise <= stepHeight) {
           const oldY = p.y;
           p.y = b.max.y + EPS;
-          if (!this.overlapsBody(p, body.radius, body.height)) {
+          if (!this.overlapsBody(p, body.radius, body.height, undefined, stuck)) {
             body.stepOffset -= p.y - oldY;
             continue;
           }
@@ -150,7 +187,7 @@ export class CollisionWorld {
   }
 
   /** Returns -1 when landing on something, 1 when bumping a ceiling, 0 otherwise. */
-  private slideVertical(body: BodyState, amount: number): number {
+  private slideVertical(body: BodyState, amount: number, stuck: readonly ColliderBox[]): number {
     if (amount === 0) {
       return 0;
     }
@@ -158,7 +195,7 @@ export class CollisionWorld {
     p.y += amount;
     let res = 0;
     for (const b of this.boxes) {
-      if (!b.enabled || !b.blocksMove) continue;
+      if (!b.enabled || !b.blocksMove || stuck.includes(b)) continue;
       if (!this.boxOverlap(p, body.radius, body.height, b)) continue;
       if (amount < 0) {
         p.y = b.max.y;
@@ -200,9 +237,10 @@ export class CollisionWorld {
     return best;
   }
 
-  /** Room above the body for standing up. */
-  canStand(pos: THREE.Vector3, radius: number, height: number): boolean {
-    return !this.overlapsBody(pos, radius, height);
+  /** Room above the body for standing up. Boxes the current (crouched) body already intersects are ignored. */
+  canStand(pos: THREE.Vector3, radius: number, height: number, current?: BodyState): boolean {
+    const ignore = current ? this.overlapping(current.pos, current.radius, current.height, _standIgnore) : undefined;
+    return !this.overlapsBody(pos, radius, height, undefined, ignore);
   }
 
   // ---------------------------------------------------------------------------
@@ -277,12 +315,17 @@ export class CollisionWorld {
     let bounced = false;
     let impactSpeed = 0;
     let grounded = false;
+    // A grenade already inside a box (a barrier raised on it) flies on instead of being
+    // flung out of the face it happens to be moving towards.
+    const inside = (b: ColliderBox): boolean => pos.x - r < b.max.x && pos.x + r > b.min.x && pos.y - r < b.max.y && pos.y + r > b.min.y && pos.z - r < b.max.z && pos.z + r > b.min.z;
+    _stuck.length = 0;
+    for (const b of this.boxes) if (b.enabled && b.blocksMove && inside(b)) _stuck.push(b);
     for (const axis of AXES) {
       const amt = vel[axis] * dt;
       if (amt === 0) continue;
       pos[axis] += amt;
       for (const b of this.boxes) {
-        if (!b.enabled || !b.blocksMove) continue;
+        if (!b.enabled || !b.blocksMove || _stuck.includes(b)) continue;
         if (
           pos.x - r < b.max.x &&
           pos.x + r > b.min.x &&
@@ -313,6 +356,10 @@ export class CollisionWorld {
 }
 
 const AXES = ['x', 'y', 'z'] as const;
+/** Metres per second a body is pushed out of a box it ended up inside. */
+const DEPEN_SPEED = 3.5;
+const _stuck: ColliderBox[] = [];
+const _standIgnore: ColliderBox[] = [];
 const _disp = new THREE.Vector3();
 const _dir = new THREE.Vector3();
 const _hit: RayHit = { dist: 0, point: new THREE.Vector3(), normal: new THREE.Vector3(), box: null as unknown as ColliderBox };

@@ -16,7 +16,12 @@ import type { ClientMsg, HostMsg } from './protocol';
  */
 
 const KEEPALIVE = 'ka';
-const PEER_TIMEOUT_MS = 12000;
+/**
+ * Silence that counts as a dead peer. Closed tabs and broken links are reported much sooner by
+ * the data channel / ICE events; this only catches peers that went quiet, and a busy main thread
+ * (first-time shader compiles, a slow frame) must not be mistaken for that. It was 12 s.
+ */
+const PEER_TIMEOUT_MS = 30000;
 
 type Inbox =
   | { kind: 'toHost'; from: string; msg: ClientMsg }
@@ -58,6 +63,8 @@ export class Net {
   /** Last time anything arrived from each peer ('host' on clients). */
   private lastRecv = new Map<string, number>();
   private hostLost = false;
+  /** Why the host connection ended (client side), shown on the menu. */
+  lostReason = '';
   handlers: NetHandlers | null = null;
   /** Bytes sent in the last second (debug overlay). */
   stats = { sent: 0, recv: 0 };
@@ -172,8 +179,9 @@ export class Net {
         this.remotes.set(conn.peer, r);
       }
       const remote = r;
+      const fast = conn.label === 'fast';
       conn.on('open', () => {
-        if (conn.label === 'fast') remote.fast = conn;
+        if (fast) remote.fast = conn;
         else remote.rel = conn;
         if (remote.rel && remote.fast && !remote.ready) {
           remote.ready = true;
@@ -183,7 +191,7 @@ export class Net {
         // ICE failures do not always close the DataConnection; watch the peer connection too.
         const pc = conn.peerConnection;
         pc?.addEventListener('iceconnectionstatechange', () => {
-          if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed') drop();
+          if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed') lost(`ICE ${pc.iceConnectionState}`);
         });
       });
       conn.on('data', (data) => {
@@ -192,8 +200,9 @@ export class Net {
         if ((data as { t?: string }).t === KEEPALIVE) return;
         this.inbox.push({ kind: 'toHost', from: conn.peer, msg: data as ClientMsg });
       });
-      const drop = (): void => {
+      const drop = (reason: string): void => {
         if (!this.remotes.has(conn.peer)) return;
+        console.warn('[net] dropping peer', conn.peer, reason);
         this.remotes.delete(conn.peer);
         try {
           remote.rel?.close();
@@ -203,8 +212,20 @@ export class Net {
         }
         if (remote.ready) this.inbox.push({ kind: 'left', id: conn.peer });
       };
-      conn.on('close', drop);
-      conn.on('error', drop);
+      // PeerJS gives every DataConnection its own RTCPeerConnection, so the state channel can
+      // fail on its own. Only the reliable channel ends a player's session; losing 'fast'
+      // just moves state/snapshot traffic onto 'rel'.
+      const lost = (reason: string): void => {
+        if (!fast) drop(`rel: ${reason}`);
+        else if (remote.fast === conn) {
+          console.warn('[net] state channel lost, falling back to reliable channel', conn.peer, reason);
+          remote.fast = null;
+        }
+      };
+      conn.on('close', () => lost('closed'));
+      // Fatal errors (ICE failed/closed) are followed by 'close'; others (oversized or early
+      // messages) only drop that one message and must not end the session.
+      conn.on('error', (err) => console.warn('[net]', conn.label, err.type, err.message));
     });
     peer.on('disconnected', () => {
       // Lost the signalling server only — existing P2P links keep working. Try to stay reachable.
@@ -227,19 +248,25 @@ export class Net {
         if ((data as { t?: string }).t === KEEPALIVE) return;
         this.inbox.push({ kind: 'toClient', msg: data as HostMsg });
       });
-      c.on('close', () => this.loseHost());
+      c.on('error', (err) => console.warn('[net]', c.label, err.type, err.message));
     }
+    // Only the reliable channel is the session's lifeline (see listenAsHost); a dead state
+    // channel falls back to it in toHost().
+    this.hostRel!.on('close', () => this.loseHost('신뢰 채널이 닫힘'));
+    this.hostFast!.on('close', () => console.warn('[net] state channel closed, using the reliable channel'));
     const pc = this.hostRel!.peerConnection;
     if (pc) {
       pc.addEventListener('iceconnectionstatechange', () => {
-        if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed') this.loseHost();
+        if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed') this.loseHost(`ICE ${pc.iceConnectionState}`);
       });
     }
   }
 
-  private loseHost(): void {
+  private loseHost(reason: string): void {
     if (this.hostLost) return;
     this.hostLost = true;
+    this.lostReason = reason;
+    console.warn('[net] lost host:', reason);
     this.inbox.push({ kind: 'left', id: 'host' });
   }
 
@@ -256,6 +283,7 @@ export class Net {
         if (!r.ready) continue;
         if (r.rel?.open) void r.rel.send(ka);
         if (now - (this.lastRecv.get(r.id) ?? now) > PEER_TIMEOUT_MS) {
+          console.warn('[net] dropping peer', r.id, `no data for ${PEER_TIMEOUT_MS / 1000}s`);
           this.remotes.delete(r.id);
           try {
             r.rel?.close();
@@ -268,7 +296,7 @@ export class Net {
       }
     } else {
       if (this.hostRel?.open) void this.hostRel.send(ka);
-      if (now - (this.lastRecv.get('host') ?? now) > PEER_TIMEOUT_MS) this.loseHost();
+      if (now - (this.lastRecv.get('host') ?? now) > PEER_TIMEOUT_MS) this.loseHost(`${PEER_TIMEOUT_MS / 1000}초 동안 응답 없음`);
     }
   }
 
@@ -283,7 +311,7 @@ export class Net {
       this.inbox.push({ kind: 'toHost', from: this.selfId, msg });
       return;
     }
-    const c = fast ? this.hostFast : this.hostRel;
+    const c = fast && this.hostFast?.open ? this.hostFast : this.hostRel;
     if (c?.open) {
       this.stats.sent++;
       void c.send(msg);
@@ -295,7 +323,7 @@ export class Net {
     if (this.closed || !this.isHost) return;
     for (const r of this.remotes.values()) {
       if (!r.ready || r.id === except) continue;
-      const c = fast ? r.fast : r.rel;
+      const c = fast && r.fast?.open ? r.fast : r.rel;
       if (c?.open) {
         this.stats.sent++;
         void c.send(msg);
@@ -312,7 +340,7 @@ export class Net {
       return;
     }
     const r = this.remotes.get(id);
-    const c = fast ? r?.fast : r?.rel;
+    const c = fast && r?.fast?.open ? r.fast : r?.rel;
     if (c?.open) {
       this.stats.sent++;
       void c.send(msg);

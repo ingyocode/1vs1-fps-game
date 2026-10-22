@@ -52,6 +52,12 @@ interface Shell {
   life: number;
 }
 
+/** First-person sleeves and gloves matching the third-person factions (FBI navy / insurgent olive). */
+const ARM_LOOK: Record<TeamId, { sleeve: number; glove: number }> = {
+  0: { sleeve: 0x1f2c47, glove: 0x141518 },
+  1: { sleeve: 0x4d4a34, glove: 0x2e271f },
+};
+
 const _v = new THREE.Vector3();
 const _w = new THREE.Vector3();
 const _up = new THREE.Vector3(0, 1, 0);
@@ -115,9 +121,9 @@ export class ViewModel {
     scene.add(this.root);
     this.root.add(this.rig);
     this.rig.add(this.holder);
-    this.sleeveMat = new THREE.MeshStandardMaterial({ color: 0x3a3f48, roughness: 0.9 });
-    this.gloveMat = new THREE.MeshStandardMaterial({ color: 0x24262b, roughness: 0.72, metalness: 0.05 });
-    this.cuffMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(TEAMS[team].color).multiplyScalar(1.1) });
+    this.sleeveMat = new THREE.MeshStandardMaterial({ color: ARM_LOOK[team].sleeve, roughness: 0.9 });
+    this.gloveMat = new THREE.MeshStandardMaterial({ color: ARM_LOOK[team].glove, roughness: 0.72, metalness: 0.05 });
+    this.cuffMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(TEAMS[team].color).multiplyScalar(0.9) });
     for (let i = 0; i < 2; i++) {
       const upper = new THREE.Mesh(new THREE.CapsuleGeometry(0.05, 0.3, 4, 14), this.sleeveMat);
       const fore = new THREE.Mesh(new THREE.CapsuleGeometry(0.042, 0.32, 4, 14), this.sleeveMat);
@@ -166,7 +172,9 @@ export class ViewModel {
   }
 
   setTeam(team: TeamId): void {
-    this.cuffMat.color.set(TEAMS[team].color).multiplyScalar(1.1);
+    this.cuffMat.color.set(TEAMS[team].color).multiplyScalar(0.9);
+    this.sleeveMat.color.set(ARM_LOOK[team].sleeve);
+    this.gloveMat.color.set(ARM_LOOK[team].glove);
   }
 
   get weapon(): WeaponId {
@@ -231,10 +239,12 @@ export class ViewModel {
   fire(kickScale: number, infinite: boolean): void {
     const def = WEAPONS[this.gunId];
     if (def.slot === 'melee') return;
-    const strength = clamp(def.recoil.pattern[0][0] * 6 + 0.25, 0.3, 1.2) * kickScale;
-    const adsDamp = lerp(1, 0.45, this.curAds);
-    this.recoilPos.impulse((Math.random() - 0.5) * 0.04 * strength, 0.05 * strength * adsDamp, 0.9 * strength * adsDamp);
-    this.recoilRot.impulse(1.6 * strength * adsDamp, (Math.random() - 0.5) * 0.5 * strength, (Math.random() - 0.5) * 1.2 * strength);
+    // Kick scales with the weapon's strongest per-shot climb (spray patterns start at 0).
+    const climb = Math.max(def.recoil.tail[0], ...def.recoil.pattern.map((p) => p[0]));
+    const strength = clamp(climb * 6 + 0.25, 0.3, 1.25) * kickScale;
+    const adsDamp = lerp(1, 0.5, this.curAds);
+    this.recoilPos.impulse((Math.random() - 0.5) * 0.05 * strength, 0.06 * strength * adsDamp, 1.08 * strength * adsDamp);
+    this.recoilRot.impulse(1.95 * strength * adsDamp, (Math.random() - 0.5) * 0.65 * strength, (Math.random() - 0.5) * 1.45 * strength);
     this.flashT = 0.05;
     this.flash.visible = true;
     this.flash.rotation.z = Math.random() * Math.PI;

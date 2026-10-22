@@ -1,7 +1,7 @@
 import { h, clear, setText } from './dom';
 import { ABILITY_ICONS, ICONS, WEAPON_ICONS } from './icons';
 import { ARMOR_ITEMS, PRIMARY_IDS, SECONDARY_IDS, WEAPONS, type WeaponId } from '../game/weapons';
-import { ABILITIES, MAX_TIER, TIERS, UPGRADE_COST, activeSynergies, type Tier } from '../game/abilities';
+import { ABILITIES, BONUS_PICK_LOSSES, MAX_TIER, TIERS, activeSynergies } from '../game/abilities';
 import type { PlayerInfo } from '../net/protocol';
 import type { AudioEngine } from '../audio/audio';
 
@@ -20,6 +20,7 @@ export class ShopView {
   private timerEl: HTMLElement;
   private msgEl: HTMLElement;
   private lastKey = '';
+  private range = false;
   open = false;
 
   constructor(
@@ -62,11 +63,16 @@ export class ShopView {
     setText(this.msgEl, text);
   }
 
-  update(me: PlayerInfo | undefined, timeLeft: number): void {
+  /**
+   * `losses` = rounds my team has lost (drives the bonus augment meter).
+   * `range` = shooting range: everything is free and the timer means nothing.
+   */
+  update(me: PlayerInfo | undefined, timeLeft: number, losses: number, range = false): void {
     if (!this.open || !me) return;
-    setText(this.goldEl, `${me.gold.toLocaleString()} G`);
-    setText(this.timerEl, `${Math.ceil(timeLeft)}초`);
-    const key = JSON.stringify([me.gold, me.primary, me.secondary, me.armor, me.abilities]);
+    this.range = range;
+    setText(this.goldEl, range ? '무료' : `${me.gold.toLocaleString()} G`);
+    setText(this.timerEl, range ? '사격장' : `${Math.ceil(timeLeft)}초`);
+    const key = JSON.stringify([me.gold, me.primary, me.secondary, me.armor, me.abilities, losses, range]);
     if (key === this.lastKey) return;
     this.lastKey = key;
     clear(this.body);
@@ -91,41 +97,40 @@ export class ShopView {
             );
           }),
         ),
-        this.section(
-          '능력 강화',
-          me.abilities.length
+        this.section('보유 능력', [
+          ...(me.abilities.length
             ? me.abilities.map((ab) => {
                 const def = ABILITIES[ab.id];
                 const tr = TIERS[ab.tier];
-                const max = ab.tier >= MAX_TIER;
-                const cost = max ? 0 : UPGRADE_COST[ab.tier as 0 | 1];
-                const nextTier = (max ? ab.tier : ab.tier + 1) as Tier;
-                const next = TIERS[nextTier];
                 return h(
-                  'button',
-                  {
-                    class: `shop-item upgrade ${max ? 'owned' : ''} ${!max && me.gold < cost ? 'poor' : ''}`,
-                    style: `--rc:${tr.color}`,
-                    title: `${next.roman} ${def.tiers[nextTier].title}\n${def.describe(nextTier)}`,
-                    onclick: () => this.buy(`up:${ab.id}`),
-                    onmouseenter: () => this.audio.uiHover(),
-                  },
+                  'div',
+                  { class: `shop-item upgrade static ${ab.tier >= MAX_TIER ? 'owned' : ''}`, style: `--rc:${tr.color}`, title: def.describe(ab.tier) },
                   h('div', { class: 'si-icon', html: ABILITY_ICONS[ab.id] }),
                   h('div', { class: 'si-name' }, def.name),
-                  h(
-                    'div',
-                    { class: 'si-desc' },
-                    max ? `${tr.roman} ${def.tiers[ab.tier].title} (각성)` : h('span', {}, h('em', { style: `color:${tr.color}` }, tr.roman), ' → ', h('em', { style: `color:${next.color}` }, `${next.roman} ${def.tiers[nextTier].title}`)),
-                  ),
-                  h('div', { class: 'si-price' }, max ? 'MAX' : `${cost} G`),
+                  h('div', { class: 'si-desc' }, h('em', { style: `color:${tr.color}` }, tr.roman), ` ${def.tiers[ab.tier].title}`),
+                  h('div', { class: 'si-price' }, ab.tier >= MAX_TIER ? '각성' : tr.name),
                 );
               })
-            : [h('div', { class: 'shop-empty' }, '보유한 능력이 없습니다')],
-        ),
+            : [h('div', { class: 'shop-empty' }, '보유한 능력이 없습니다')]),
+          this.bonusMeter(losses),
+        ]),
       ),
     );
     const syn = activeSynergies(me.abilities);
     if (syn.length) this.body.append(h('div', { class: 'shop-syn' }, ...syn.map((s) => h('div', { class: 'syn-chip big' }, `⟡ ${s.name}`, h('span', {}, s.desc)))));
+  }
+
+  /** Abilities are never sold; losing rounds earns extra draft cards instead. */
+  private bonusMeter(losses: number): HTMLElement {
+    const into = losses % BONUS_PICK_LOSSES;
+    const pips = Array.from({ length: BONUS_PICK_LOSSES }, (_, i) => h('i', { class: i < into ? 'on' : '' }));
+    return h(
+      'div',
+      { class: 'shop-bonus' },
+      h('div', { class: 'sb-title' }, '추가 증강'),
+      h('div', { class: 'sb-pips' }, ...pips),
+      h('div', { class: 'sb-text' }, `능력은 골드로 강화할 수 없습니다. 라운드를 ${BONUS_PICK_LOSSES}번 질 때마다 다음 구매 단계에서 증강 카드를 한 장 더 고릅니다${into ? ` (다음까지 ${BONUS_PICK_LOSSES - into}패)` : ''}.`),
+    );
   }
 
   private section(title: string, items: HTMLElement[]): HTMLElement {
@@ -135,7 +140,7 @@ export class ShopView {
   private weaponCard(id: WeaponId, me: PlayerInfo): HTMLElement {
     const d = WEAPONS[id];
     const owned = me.primary === id || me.secondary === id;
-    const afford = me.gold >= d.price;
+    const afford = this.range || me.gold >= d.price;
     return h(
       'button',
       { class: `shop-item weapon ${owned ? 'owned' : ''} ${!afford && !owned ? 'poor' : ''}`, onclick: () => this.buy(id), onmouseenter: () => this.audio.uiHover() },
@@ -144,7 +149,7 @@ export class ShopView {
       h('div', { class: 'si-name' }, d.nameKo),
       h('div', { class: 'si-bars' }, ...BAR_LABELS.map(([k, label]) => h('div', { class: 'si-bar' }, h('span', {}, label), h('i', {}, h('b', { style: `width:${Math.round(d.bars[k] * 100)}%` }))))),
       h('div', { class: 'si-meta' }, `${d.mag || '∞'}발 · ${d.rpm}RPM`),
-      h('div', { class: 'si-price' }, owned ? '보유 중' : d.price === 0 ? '무료' : `${d.price.toLocaleString()} G`),
+      h('div', { class: 'si-price' }, owned ? '보유 중' : d.price === 0 || this.range ? '무료' : `${d.price.toLocaleString()} G`),
     );
   }
 

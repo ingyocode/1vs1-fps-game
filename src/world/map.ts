@@ -20,6 +20,16 @@ export interface CoinSpot {
   pair: number;
 }
 
+/** A shooting-range target: stands at `pos` facing `yaw`, optionally strafing / crouch-peeking. */
+export interface RangeTarget {
+  name: string;
+  pos: THREE.Vector3;
+  yaw: number;
+  /** Half-width of the strafe lane in metres (0 = static). */
+  strafe: number;
+  crouch: boolean;
+}
+
 export interface RadarRect {
   x0: number;
   z0: number;
@@ -38,6 +48,8 @@ export interface GameMap {
   navNodes: THREE.Vector3[];
   radar: RadarRect[];
   bounds: { minX: number; maxX: number; minZ: number; maxZ: number };
+  /** Shooting-range layout: the firing spot and target stations. */
+  range: { spawn: SpawnPoint; targets: RangeTarget[] };
   pointLights: THREE.PointLight[];
   setSpawnBarriers(active: boolean): void;
   update(time: number, dt: number): void;
@@ -248,7 +260,8 @@ export function buildMap(lib: MaterialLibrary): GameMap {
     deco(ax - 0.28, ax + 0.28, h - 0.22, h - 0.04, az - 0.16, az + 0.16, 'trim', { tint: [0.12, 0.12, 0.13] });
     deco(ax - 0.24, ax + 0.24, h - 0.24, h - 0.2, az - 0.12, az + 0.12, 'lampLens');
     if (withLight) {
-      const l = new THREE.PointLight(color, intensity, 16, 1.8);
+      // Lamp heads stay readable without blowing out the walls right next to them.
+      const l = new THREE.PointLight(color, intensity * 0.78, 16, 1.8);
       l.position.set(ax, h - 0.5, az);
       root.add(l);
       pointLights.push(l);
@@ -297,7 +310,8 @@ export function buildMap(lib: MaterialLibrary): GameMap {
 
   const sign = (text: string[], color: string, x: number, y: number, z: number, w: number, h: number, ry: number, intensity = 2.2): void => {
     const tex = textTexture(text, color, 1024, Math.round((1024 * h) / w));
-    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, toneMapped: true, color: new THREE.Color(1, 1, 1).multiplyScalar(intensity) });
+    // Signs read as lit panels, not light sources: 0.7 keeps them under the bloom threshold.
+    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, toneMapped: true, color: new THREE.Color(1, 1, 1).multiplyScalar(intensity * 0.7) });
     const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
     mesh.position.set(x, y, z);
     mesh.rotation.y = ry;
@@ -418,7 +432,7 @@ export function buildMap(lib: MaterialLibrary): GameMap {
     // Team emblem on the spawn floor and team banner on the back wall
     {
       const tex = spawnEmblem(512, TEAMS[team].css, TEAMS[team].name);
-      const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, color: new THREE.Color(1, 1, 1).multiplyScalar(1.6) });
+      const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, color: new THREE.Color(1, 1, 1).multiplyScalar(1.15) });
       const mesh = new THREE.Mesh(new THREE.PlaneGeometry(6, 6), mat);
       mesh.rotation.x = -Math.PI / 2;
       mesh.rotation.z = s === 1 ? -Math.PI / 2 : Math.PI / 2;
@@ -529,7 +543,7 @@ export function buildMap(lib: MaterialLibrary): GameMap {
       place(cylLow, X(-9), 6.0, zz, 0, 0, 0, 'trim', [0.2, 0.2, 0.2], 0, [1, 1], 0.015, 1.0, 0.015);
       place(sphere, X(-9), 5.45, zz, 0, 0, 0, 'trim', [0.25, 0.26, 0.24], 0, [1, 1], 0.42, 0.2, 0.42);
       deco(X(-9) - 0.3, X(-9) + 0.3, 5.36, 5.4, zz - 0.3, zz + 0.3, 'lampLens');
-      const l = new THREE.PointLight(0xffb070, 30, 18, 1.6);
+      const l = new THREE.PointLight(0xffb070, 23, 18, 1.6);
       l.position.set(X(-9), 5.1, zz);
       root.add(l);
       pointLights.push(l);
@@ -610,7 +624,7 @@ export function buildMap(lib: MaterialLibrary): GameMap {
   deco(-0.7, 0.7, 4.6, 4.75, -0.7, 0.7, 'trim', { tint: [0.15, 0.15, 0.16] });
   const beaconRing = new THREE.Mesh(
     new THREE.TorusGeometry(0.95, 0.035, 8, 48),
-    new THREE.MeshBasicMaterial({ color: new THREE.Color(0xffc070).multiplyScalar(4) }),
+    new THREE.MeshBasicMaterial({ color: new THREE.Color(0xffc070).multiplyScalar(2.6) }),
   );
   beaconRing.position.set(0, 5.1, 0);
   root.add(beaconRing);
@@ -623,7 +637,7 @@ export function buildMap(lib: MaterialLibrary): GameMap {
     beaconRing.position.y = 5.1 + Math.sin(t * 1.4) * 0.08;
   });
   {
-    const l = new THREE.PointLight(0xffb060, 20, 14, 1.7);
+    const l = new THREE.PointLight(0xffb060, 15, 14, 1.7);
     l.position.set(0, 4.2, 0);
     root.add(l);
     pointLights.push(l);
@@ -639,7 +653,7 @@ export function buildMap(lib: MaterialLibrary): GameMap {
   {
     place(sphere, 0, 5.45, 18.2, 0, 0, 0, 'trim', [0.25, 0.26, 0.24], 0, [1, 1], 0.42, 0.2, 0.42);
     deco(-0.3, 0.3, 5.36, 5.4, 17.9, 18.5, 'lampLens');
-    const l = new THREE.PointLight(0xffb070, 24, 16, 1.6);
+    const l = new THREE.PointLight(0xffb070, 18, 16, 1.6);
     l.position.set(0, 5.1, 18.2);
     root.add(l);
     pointLights.push(l);
@@ -697,7 +711,7 @@ export function buildMap(lib: MaterialLibrary): GameMap {
     g.setAttribute('aT', new THREE.Float32BufferAttribute(ts, 1));
     g.setIndex(idx);
     g.computeVertexNormals();
-    const shaft = new THREE.Mesh(g, lightShaftMaterial(0xffc890, 0.16));
+    const shaft = new THREE.Mesh(g, lightShaftMaterial(0xffc890, 0.1));
     shaft.renderOrder = 3;
     shaft.frustumCulled = false;
     root.add(shaft);
@@ -977,6 +991,25 @@ export function buildMap(lib: MaterialLibrary): GameMap {
   }
   navNodes.push(V(0, 0, -11.6), V(0, 0, -18.2), V(0, 1.2, 1.8), V(0, 1.2, -1.8), V(0, 0, 12.8), V(0, 0, 18.6), V(0, 0, 4.4), V(0, 0, -4.4));
 
+  // Shooting range down the warehouse (firing spot by the west wall, looking east). Every
+  // target sits on its own sight line: through the gap between the pallet racks (z 13.6–17.4)
+  // and past the conveyor (z 14.8–16.0, pallets to 1.5 m), so none hides another; two stand
+  // on the rack tops (3 m) for vertical aim.
+  const faceWest = Math.PI / 2;
+  const target = (name: string, x: number, y: number, z: number, strafe = 0, crouch = false): RangeTarget => ({ name, pos: V(x, y, z), yaw: faceWest, strafe, crouch });
+  const range = {
+    spawn: { pos: V(-20.5, 0, 15.5), yaw: -Math.PI / 2 },
+    targets: [
+      target('고지대 표적 6m', -14.5, 3.0, 13.1),
+      target('표적 10m · 앉기', -10.5, 0, 16.6, 0, true),
+      target('이동 표적 15m', -5.0, 0, 13.4, 0.6),
+      target('표적 26m', 5.5, 0, 16.9),
+      target('이동 표적 30m', 9.5, 0, 13.9, 0.5),
+      target('고지대 표적 36m', 15, 3.0, 17.9),
+      target('저격 표적 41m', 20.8, 0, 16.8),
+    ],
+  };
+
   const setSpawnBarriers = (active: boolean): void => {
     for (const t of [0, 1] as TeamId[]) for (const bx of spawnBarrierBoxes[t]) bx.enabled = active;
     for (const m of spawnBarrierMeshes) m.visible = active;
@@ -992,6 +1025,7 @@ export function buildMap(lib: MaterialLibrary): GameMap {
     navNodes,
     radar,
     bounds: { minX: -36.4, maxX: 36.4, minZ: -21.3, maxZ: 21.4 },
+    range,
     pointLights,
     setSpawnBarriers,
     update(time: number, dt: number) {

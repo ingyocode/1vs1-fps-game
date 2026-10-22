@@ -389,13 +389,33 @@ const _tmp = new THREE.Vector3();
 // Short-lived world lights (fixed pool to avoid shader recompiles)
 // -----------------------------------------------------------------------------
 
-class LightPool {
-  readonly lights: { light: THREE.PointLight; t: number; max: number; peak: number }[] = [];
-  constructor(scene: THREE.Scene, count: number) {
-    for (let i = 0; i < count; i++) {
+export const EFFECT_LIGHTS = 4;
+
+/**
+ * The pool's lights live in the scene for the whole app run. The number of lights is part of
+ * every lit material's shader, so adding them when a match starts (and removing them after)
+ * made the first frame of every session recompile all map shaders synchronously — a freeze
+ * long enough to drop pointer lock and time out the network link.
+ */
+export function ensureEffectLights(scene: THREE.Scene): THREE.PointLight[] {
+  let lights = scene.userData.effectLights as THREE.PointLight[] | undefined;
+  if (!lights) {
+    lights = Array.from({ length: EFFECT_LIGHTS }, () => {
       const light = new THREE.PointLight(0xffaa66, 0, 10, 2);
       light.castShadow = false;
       scene.add(light);
+      return light;
+    });
+    scene.userData.effectLights = lights;
+  }
+  return lights;
+}
+
+class LightPool {
+  readonly lights: { light: THREE.PointLight; t: number; max: number; peak: number }[] = [];
+  constructor(scene: THREE.Scene) {
+    for (const light of ensureEffectLights(scene)) {
+      light.intensity = 0;
       this.lights.push({ light, t: 1, max: 1, peak: 0 });
     }
   }
@@ -527,7 +547,7 @@ export class Effects {
     this.smokeP = new ParticleSystem(puff, false, 500);
     this.holes = new DecalPool(bulletHole(), 160);
     this.scorches = new DecalPool(scorch(), 16, 0.9);
-    this.lights = new LightPool(scene, 4);
+    this.lights = new LightPool(scene);
     this.ringMat = new THREE.MeshBasicMaterial({ map: ringTex(), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, color: 0xffffff, side: THREE.DoubleSide });
     this.sphereMat = new THREE.ShaderMaterial({
       uniforms: { uColor: { value: new THREE.Color(0x60e0ff) }, uAlpha: { value: 1 } },
@@ -550,7 +570,8 @@ export class Effects {
 
   dispose(): void {
     this.scene.remove(this.group);
-    for (const l of this.lights.lights) this.scene.remove(l.light);
+    // Lights stay in the scene (see ensureEffectLights); just switch them off.
+    for (const l of this.lights.lights) l.light.intensity = 0;
   }
 
   clearRound(): void {

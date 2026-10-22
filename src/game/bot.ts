@@ -3,8 +3,8 @@ import type { HitZone } from '../core/config';
 import { clamp, coneDirection, dampAngle, dirFromYawPitch, randRange, wrapAngle } from '../core/utils';
 import { F, WEAPON_INDEX, type ShotHit } from '../net/protocol';
 import { CharacterMotor, type MoveInput } from './movement';
-import { WEAPONS, damageAt, type WeaponId } from './weapons';
-import { ABILITIES, CLOAK_FLICKER, ECHO_DELAY, MAX_TIER, SLOW_MULT, hasSynergy, stat, synergyPartners, tierOf, type AbilityId, type DraftCard, type Tier } from './abilities';
+import { WEAPONS, ZONE_PRIORITY, damageAt, type WeaponId } from './weapons';
+import { ABILITIES, CLOAK_FLICKER, ECHO_DELAY, SLOW_MULT, hasSynergy, stat, synergyPartners, tierOf, type AbilityId, type DraftCard, type Tier } from './abilities';
 import type { HostPlayer, MatchHost } from './host';
 import { GRENADE_GRAVITY, THROW_SPEED } from './projectiles';
 
@@ -25,8 +25,20 @@ const now = (): number => performance.now();
 const _eyeA = new THREE.Vector3();
 const _eyeB = new THREE.Vector3();
 
+/** Shooting-range target: holds a station, strafes ADAD-style or crouch-peeks, never fights back. */
+export interface DummyRole {
+  home: THREE.Vector3;
+  yaw: number;
+  strafe: number;
+  crouch: boolean;
+  dir: number;
+  flipT: number;
+  t: number;
+}
+
 export class BotBrain {
   readonly motor = new CharacterMotor();
+  dummy: DummyRole | null = null;
   private weapon: WeaponId = 'pistol';
   private ammo = new Map<WeaponId, Ammo>();
   private reloadT = 0;
@@ -200,6 +212,11 @@ export class BotBrain {
     this.suppressUntil = Math.max(this.suppressUntil, now() + duration * 1000);
   }
 
+  /** A bonus draft card changed the loadout mid buy phase: new abilities start charged. */
+  onAbilitiesChanged(): void {
+    this.refillCharges();
+  }
+
   /** Kill rewards of awakened dash / adrenaline (the adrenaline heal is applied by the host). */
   onKill(): void {
     const dash = tierOf(this.p.info.abilities, 'dash');
@@ -285,7 +302,8 @@ export class BotBrain {
     const p = this.p;
     const t = now();
     const phase = this.host.phase;
-    if (phase === 'draft' && this.draftOffer && t >= this.draftAt && !p.draftPicked) {
+    // Regular drafts, and bonus cards earned by losses (offered during the buy phase).
+    if ((phase === 'draft' || phase === 'buy') && this.draftOffer && t >= this.draftAt && !p.draftPicked) {
       this.host.onDraftPick(p, this.chooseCard(this.draftOffer));
       this.draftOffer = null;
     }
@@ -313,7 +331,8 @@ export class BotBrain {
     this.eye.set(this.motor.body.pos.x, this.motor.body.pos.y + this.motor.eyeHeight, this.motor.body.pos.z);
 
     let input: MoveInput = { forward: 0, right: 0, jump: false, crouch: false, walk: false, yaw: this.yaw };
-    if (phase === 'live') input = this.think(dt, t);
+    if (this.dummy) input = this.dummyInput(dt);
+    else if (phase === 'live') input = this.think(dt, t);
     else if (phase === 'buy') {
       this.yaw = dampAngle(this.yaw, p.yaw, 4, dt);
       // keep the latest loadout in hand
@@ -374,7 +393,31 @@ export class BotBrain {
     if (this.motor.dashTime > 0) f |= F.dash;
     if (t < this.throwFlagUntil) f |= F.throwing;
     p.flags = f;
-    p.hitbox.update(p.pos, p.yaw, this.motor.crouch);
+    p.hitbox.update(p.pos, p.yaw, this.motor.crouch, p.pitch, this.weapon);
+  }
+
+  private dummyInput(dt: number): MoveInput {
+    const d = this.dummy!;
+    d.t += dt;
+    this.yaw = d.yaw;
+    this.pitch = 0;
+    const input: MoveInput = { forward: 0, right: 0, jump: false, crouch: false, walk: false, yaw: d.yaw };
+    if (d.strafe > 0) {
+      // Lateral offset from home along the target's right axis; turn around at the lane edge
+      // and every so often in between, like a player jiggling a corner.
+      const off = (this.motor.body.pos.x - d.home.x) * Math.cos(d.yaw) - (this.motor.body.pos.z - d.home.z) * Math.sin(d.yaw);
+      d.flipT -= dt;
+      if (off > d.strafe) d.dir = -1;
+      else if (off < -d.strafe) d.dir = 1;
+      else if (d.flipT <= 0) {
+        d.flipT = randRange(0.45, 1.3);
+        if (Math.random() < 0.45) d.dir = -d.dir;
+      }
+      input.right = d.dir;
+      input.walk = Math.sin(d.t * 0.7) > 0.6;
+    }
+    if (d.crouch) input.crouch = Math.sin(d.t * 1.5) > 0.2;
+    return input;
   }
 
   private chooseCard(offer: DraftCard[]): number {
@@ -405,10 +448,6 @@ export class BotBrain {
     }
     if (p.info.armor < 50 && p.info.gold >= 1000) buy('armorHeavy');
     else if (p.info.armor < 25 && p.info.gold >= 400) buy('armorLight');
-    if (p.info.gold > 2600) {
-      const up = p.info.abilities.find((a) => a.tier < MAX_TIER);
-      if (up) buy(`up:${up.id}`);
-    }
     const want = p.info.primary ?? p.info.secondary;
     this.weapon = want;
     this.ammo.clear();
@@ -538,10 +577,18 @@ export class BotBrain {
     }
     if (this.has('barrier') && this.p.info.hp < 60 && d > 9 && Math.random() < 0.5) {
       const dir = e.pos.clone().sub(this.motor.body.pos).setY(0).normalize();
-      const pos = this.motor.body.pos.clone().addScaledVector(dir, 2.2);
+      // Same placement rules as players: clear of walls, on the ground, never around a body.
+      const eye = this.eye.clone();
+      const wall = this.host.world.raycast(eye, dir, 2.6, true);
+      const dist = wall ? wall.dist - 0.45 : 2.2;
+      const pos = this.motor.body.pos.clone().addScaledVector(dir, dist);
+      const g = this.host.world.groundBelow(new THREE.Vector3(pos.x, pos.y + 1.2, pos.z), 0.05, 4);
+      if (g !== null) pos.y = g;
       const yaw = Math.abs(dir.x) > Math.abs(dir.z) ? Math.PI / 2 : 0;
-      this.host.botBarrier(this.p, pos, yaw);
-      this.use('barrier');
+      if (dist >= 1.2 && this.host.barrierFits(pos, yaw, stat('barrier', 'width', this.tier('barrier')))) {
+        this.host.botBarrier(this.p, pos, yaw);
+        this.use('barrier');
+      }
     }
     if (this.has('smoke') && stat('smoke', 'dps', this.tier('smoke')) > 0 && d > 6 && d < 24 && Math.random() < 0.3) {
       // Poison smoke is offensive: drop it on the enemy to flush them out.
@@ -736,7 +783,7 @@ export class BotBrain {
         const cur = perTarget.get(res.player);
         if (cur) {
           cur.dmg += dmg;
-          if (res.zone === 'head') cur.zone = 'head';
+          if (ZONE_PRIORITY[res.zone] > ZONE_PRIORITY[cur.zone]) cur.zone = res.zone;
         } else perTarget.set(res.player, { dmg, zone: res.zone, dist: res.dist });
       } else if (res.barrier) this.host.damageBarrier(res.barrier, def.damage, this.p);
     }

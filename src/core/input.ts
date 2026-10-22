@@ -66,6 +66,12 @@ export const KEY_LABEL: Record<string, string> = {
 };
 
 /**
+ * Browser function keys that reload the page or move focus out of it while playing
+ * (F1 help, F3 find, F5 reload, F6 address bar, F7 caret-browsing prompt, F10 menu).
+ */
+const BROWSER_KEYS = new Set(['F1', 'F3', 'F5', 'F6', 'F7', 'F10', 'ContextMenu']);
+
+/**
  * Centralised keyboard/mouse state with per-frame edge detection.
  * Game code reads it once per frame and calls endFrame() afterwards.
  */
@@ -140,11 +146,17 @@ export class Input {
   private onKeyDown = (e: KeyboardEvent): void => {
     if (this.isTyping(e)) return;
     if (e.code === 'Tab' || (this.locked && (e.code === 'Space' || e.code.startsWith('Arrow')))) e.preventDefault();
+    // While playing, browser shortcuts must not fire: Ctrl/⌘+R reloads the page (a crouch-on-Ctrl
+    // habit plus R to reload), Ctrl/⌘+D/F/S/E/L and Alt open UI that takes focus, which drops
+    // pointer lock mid-fight. Ctrl/⌘+W/T/N/Q cannot be cancelled; the unload guard covers those.
+    if (this.locked && (e.ctrlKey || e.metaKey || e.altKey || BROWSER_KEYS.has(e.code))) e.preventDefault();
     if (!this.down.has(e.code)) this.pressed.add(e.code);
     this.down.add(e.code);
   };
 
   private onKeyUp = (e: KeyboardEvent): void => {
+    // A lone Alt release focuses the browser menu on Windows.
+    if (this.locked && (e.code === 'AltLeft' || e.code === 'AltRight' || e.code === 'F10')) e.preventDefault();
     this.down.delete(e.code);
     this.released.add(e.code);
   };
